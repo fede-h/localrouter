@@ -1,0 +1,8 @@
+.codex
+.DS_Store
+*.swp
+*.tmp
+
+# Local runtime state. User config lives in ~/.config/localrouter.
+.env
+.env.*

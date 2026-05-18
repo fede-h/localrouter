@@ -1,0 +1,498 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+APP_NAME="localrouter"
+VERSION="0.1.0"
+
+CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
+STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}"
+CONFIG_DIR="$CONFIG_HOME/$APP_NAME"
+STATE_DIR="$STATE_HOME/$APP_NAME"
+CONFIG_FILE="$CONFIG_DIR/config"
+MODELS_FILE="$CONFIG_DIR/models.list"
+STATE_FILE="$STATE_DIR/current_model"
+
+WINDOWS_USER="${LOCALROUTER_WINDOWS_USER:-}"
+WINDOWS_HOST="${LOCALROUTER_WINDOWS_HOST:-}"
+SSH_PORT="${LOCALROUTER_SSH_PORT:-22}"
+LOCAL_PORT="${LOCALROUTER_LOCAL_PORT:-11434}"
+REMOTE_PORT="${LOCALROUTER_REMOTE_PORT:-11434}"
+REMOTE_HOST="${LOCALROUTER_REMOTE_HOST:-localhost}"
+TARGET_TAG="${LOCALROUTER_TARGET_TAG:-qwen2.5-coder:7b}"
+STOP_LOCAL_OLLAMA="${LOCALROUTER_STOP_LOCAL_OLLAMA:-ask}"
+SSH_OPTS="${LOCALROUTER_SSH_OPTS:-}"
+
+ASSUME_YES=false
+KEEP_SESSION=false
+SELECTED_MODEL=""
+STOP_LOCAL_OLLAMA_OVERRIDE=""
+
+usage() {
+    cat <<EOF
+$APP_NAME $VERSION
+
+Bridge a local Ollama client to an Ollama server reachable over SSH.
+
+Usage:
+  $APP_NAME [--model MODEL] [--keep] [--edit-models] [--status]
+  $APP_NAME --init-config
+
+Options:
+  --model MODEL          Pull/copy MODEL on the remote host before opening the tunnel.
+  --keep                 Open or keep the tunnel without changing the tracked model.
+  --edit-models          Edit the local model list interactively.
+  --status               Show current config, tracked model, and tunnel state.
+  --init-config          Create config and model-list files if they do not exist.
+  --yes                  Answer yes to local service prompts.
+  --no-stop-local-ollama Do not offer to stop local ollama when it owns the port.
+  --help                 Show this help.
+  --version              Print the version.
+
+Config:
+  $CONFIG_FILE
+  $MODELS_FILE
+
+Required config values:
+  WINDOWS_USER
+  WINDOWS_HOST
+EOF
+}
+
+die() {
+    printf 'error: %s\n' "$*" >&2
+    exit 1
+}
+
+info() {
+    printf '%s\n' "$*"
+}
+
+ensure_dirs() {
+    mkdir -p "$CONFIG_DIR" "$STATE_DIR"
+    chmod 700 "$CONFIG_DIR" "$STATE_DIR"
+}
+
+write_default_config() {
+    ensure_dirs
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        cat >"$CONFIG_FILE" <<'EOF'
+# localrouter config
+#
+# Required:
+# WINDOWS_USER="your-windows-user"
+# WINDOWS_HOST="192.168.1.50"
+#
+# Optional:
+# SSH_PORT="22"
+# LOCAL_PORT="11434"
+# REMOTE_HOST="localhost"
+# REMOTE_PORT="11434"
+# TARGET_TAG="qwen2.5-coder:7b"
+# STOP_LOCAL_OLLAMA="ask"     # ask, yes, or no
+# SSH_OPTS="-o ServerAliveInterval=30 -o ExitOnForwardFailure=yes"
+EOF
+        chmod 600 "$CONFIG_FILE"
+        info "Created $CONFIG_FILE"
+    fi
+
+    if [[ ! -f "$MODELS_FILE" ]]; then
+        cat >"$MODELS_FILE" <<'EOF'
+qwen2.5-coder:7b-instruct-q4_K_M
+deepseek-coder:7b
+gemma3:4b-q8_0
+EOF
+        chmod 600 "$MODELS_FILE"
+        info "Created $MODELS_FILE"
+    fi
+}
+
+load_config() {
+    ensure_dirs
+    if [[ -f "$CONFIG_FILE" ]]; then
+        # shellcheck source=/dev/null
+        source "$CONFIG_FILE"
+    fi
+
+    WINDOWS_USER="${LOCALROUTER_WINDOWS_USER:-${WINDOWS_USER:-}}"
+    WINDOWS_HOST="${LOCALROUTER_WINDOWS_HOST:-${WINDOWS_HOST:-}}"
+    SSH_PORT="${LOCALROUTER_SSH_PORT:-${SSH_PORT:-22}}"
+    LOCAL_PORT="${LOCALROUTER_LOCAL_PORT:-${LOCAL_PORT:-11434}}"
+    REMOTE_PORT="${LOCALROUTER_REMOTE_PORT:-${REMOTE_PORT:-11434}}"
+    REMOTE_HOST="${LOCALROUTER_REMOTE_HOST:-${REMOTE_HOST:-localhost}}"
+    TARGET_TAG="${LOCALROUTER_TARGET_TAG:-${TARGET_TAG:-qwen2.5-coder:7b}}"
+    STOP_LOCAL_OLLAMA="${LOCALROUTER_STOP_LOCAL_OLLAMA:-${STOP_LOCAL_OLLAMA:-ask}}"
+    SSH_OPTS="${LOCALROUTER_SSH_OPTS:-${SSH_OPTS:-}}"
+}
+
+validate_port() {
+    local value="$1"
+    local name="$2"
+    [[ "$value" =~ ^[0-9]+$ ]] || die "$name must be a port number"
+    (( value >= 1 && value <= 65535 )) || die "$name must be between 1 and 65535"
+}
+
+validate_model_tag() {
+    local value="$1"
+    local name="$2"
+    [[ -n "$value" ]] || die "$name cannot be empty"
+    [[ "$value" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*(:[A-Za-z0-9][A-Za-z0-9._-]*)?$ ]] \
+        || die "$name contains unsupported characters: $value"
+}
+
+validate_config() {
+    [[ -n "$WINDOWS_USER" ]] || die "WINDOWS_USER is not configured. Run '$APP_NAME --init-config' and edit $CONFIG_FILE."
+    [[ -n "$WINDOWS_HOST" ]] || die "WINDOWS_HOST is not configured. Run '$APP_NAME --init-config' and edit $CONFIG_FILE."
+    validate_port "$SSH_PORT" "SSH_PORT"
+    validate_port "$LOCAL_PORT" "LOCAL_PORT"
+    validate_port "$REMOTE_PORT" "REMOTE_PORT"
+    validate_model_tag "$TARGET_TAG" "TARGET_TAG"
+    case "$STOP_LOCAL_OLLAMA" in
+        ask|yes|no) ;;
+        *) die "STOP_LOCAL_OLLAMA must be ask, yes, or no" ;;
+    esac
+}
+
+require_command() {
+    command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
+}
+
+ssh_base() {
+    local -a cmd=(ssh -p "$SSH_PORT")
+    if [[ -n "$SSH_OPTS" ]]; then
+        # shellcheck disable=SC2206
+        local -a extra_opts=($SSH_OPTS)
+        cmd+=("${extra_opts[@]}")
+    fi
+    cmd+=("$WINDOWS_USER@$WINDOWS_HOST")
+    printf '%s\0' "${cmd[@]}"
+}
+
+shell_quote() {
+    local value="$1"
+    printf "'%s'" "${value//\'/\'\\\'\'}"
+}
+
+remote_ollama_swap() {
+    local model="$1"
+    local quoted_model quoted_target
+    validate_model_tag "$model" "MODEL"
+    quoted_model="$(shell_quote "$model")"
+    quoted_target="$(shell_quote "$TARGET_TAG")"
+
+    local -a cmd
+    readarray -d '' -t cmd < <(ssh_base)
+    cmd+=("ollama pull $quoted_model && ollama cp $quoted_model $quoted_target")
+    "${cmd[@]}"
+}
+
+is_tunnel_active() {
+    pgrep -f "ssh .* -L ${LOCAL_PORT}:${REMOTE_HOST}:${REMOTE_PORT}" >/dev/null 2>&1
+}
+
+is_port_listening() {
+    ss -tuln | awk '{print $5}' | grep -Eq "(^|:)${LOCAL_PORT}$"
+}
+
+stop_local_ollama_if_needed() {
+    if ! is_port_listening; then
+        return
+    fi
+    if is_tunnel_active; then
+        return
+    fi
+    if ! command -v systemctl >/dev/null 2>&1; then
+        die "local port $LOCAL_PORT is already in use"
+    fi
+    if ! systemctl is-active --quiet ollama; then
+        die "local port $LOCAL_PORT is already in use"
+    fi
+
+    case "$STOP_LOCAL_OLLAMA" in
+        no)
+            die "local ollama owns port $LOCAL_PORT; set STOP_LOCAL_OLLAMA=ask or yes to stop it"
+            ;;
+        ask)
+            if [[ "$ASSUME_YES" != true ]]; then
+                read -r -p "Local ollama owns port $LOCAL_PORT. Stop it with sudo systemctl stop ollama? [y/N] " answer
+                [[ "$answer" =~ ^[Yy]$ ]] || die "cannot open tunnel while local port $LOCAL_PORT is in use"
+            fi
+            ;;
+        yes) ;;
+    esac
+
+    sudo systemctl stop ollama
+}
+
+read_models() {
+    if [[ ! -f "$MODELS_FILE" ]]; then
+        write_default_config >/dev/null
+    fi
+    mapfile -t MODELS <"$MODELS_FILE"
+
+    local clean_models=()
+    local model
+    for model in "${MODELS[@]}"; do
+        [[ -n "$model" ]] || continue
+        validate_model_tag "$model" "model in $MODELS_FILE"
+        clean_models+=("$model")
+    done
+    MODELS=("${clean_models[@]}")
+}
+
+save_models() {
+    : >"$MODELS_FILE"
+    local model
+    for model in "${MODELS[@]}"; do
+        printf '%s\n' "$model" >>"$MODELS_FILE"
+    done
+    chmod 600 "$MODELS_FILE"
+}
+
+edit_models() {
+    read_models
+    local selected=0
+    local key key2 key3 new_model
+    while true; do
+        clear
+        echo "=========================================="
+        echo "              Edit Models                 "
+        echo "=========================================="
+        echo "UP/DOWN navigate | d/delete remove | a add | q quit"
+        echo "------------------------------------------"
+        if [[ ${#MODELS[@]} -eq 0 ]]; then
+            echo " (No models in the list)"
+        else
+            if (( selected >= ${#MODELS[@]} )); then selected=$((${#MODELS[@]} - 1)); fi
+            if (( selected < 0 )); then selected=0; fi
+
+            for i in "${!MODELS[@]}"; do
+                if (( i == selected )); then
+                    echo " > ${MODELS[$i]}"
+                else
+                    echo "   ${MODELS[$i]}"
+                fi
+            done
+        fi
+        echo "=========================================="
+
+        read -rsn1 key
+        if [[ $key == $'\x1b' ]]; then
+            read -rsn2 -t 0.1 key2 || true
+            if [[ $key2 == "[A" ]]; then
+                ((selected--)) || true
+                if (( selected < 0 )); then selected=$((${#MODELS[@]} - 1)); fi
+            elif [[ $key2 == "[B" ]]; then
+                ((selected++)) || true
+                if (( selected >= ${#MODELS[@]} )); then selected=0; fi
+            elif [[ $key2 == "[3" ]]; then
+                read -rsn1 -t 0.1 key3 || true
+                if [[ $key3 == "~" ]]; then key="delete"; fi
+            fi
+        fi
+
+        if [[ $key == "delete" || $key == "d" || $key == $'\x7f' || $key == $'\b' ]]; then
+            if [[ ${#MODELS[@]} -gt 0 ]]; then
+                unset 'MODELS[selected]'
+                MODELS=("${MODELS[@]}")
+                if (( selected >= ${#MODELS[@]} && ${#MODELS[@]} > 0 )); then
+                    ((selected--)) || true
+                elif [[ ${#MODELS[@]} -eq 0 ]]; then
+                    selected=0
+                fi
+                save_models
+            fi
+        elif [[ $key == "a" || $key == "A" ]]; then
+            printf '\nEnter new model name: '
+            read -r new_model
+            if [[ -n "$new_model" ]]; then
+                validate_model_tag "$new_model" "MODEL"
+                MODELS+=("$new_model")
+                save_models
+                selected=$((${#MODELS[@]} - 1))
+            fi
+        elif [[ $key == "q" || $key == "Q" ]]; then
+            break
+        fi
+    done
+}
+
+current_model() {
+    if [[ -f "$STATE_FILE" ]]; then
+        cat "$STATE_FILE"
+    else
+        printf 'Unknown'
+    fi
+}
+
+choose_model() {
+    read_models
+    local current keep_opt choice i
+    current="$(current_model)"
+    while true; do
+        clear
+        echo "=========================================="
+        echo "           Local AI Router                "
+        echo "=========================================="
+        echo "Remote: $WINDOWS_USER@$WINDOWS_HOST:$SSH_PORT"
+        echo "Tunnel: localhost:$LOCAL_PORT -> $REMOTE_HOST:$REMOTE_PORT"
+        echo "Tracked model: $current"
+        if is_tunnel_active; then
+            echo "Status: active tunnel detected"
+        else
+            echo "Status: disconnected"
+        fi
+        echo "------------------------------------------"
+        if [[ ${#MODELS[@]} -eq 0 ]]; then
+            echo " (No models available. Press 0 to edit list)"
+        else
+            for i in "${!MODELS[@]}"; do
+                if [[ "${MODELS[$i]}" == "$current" ]]; then
+                    echo " [$((i + 1))] ${MODELS[$i]} (tracked)"
+                else
+                    echo " [$((i + 1))] ${MODELS[$i]}"
+                fi
+            done
+        fi
+        keep_opt=$((${#MODELS[@]} + 1))
+        echo " [$keep_opt] Keep current session"
+        echo " [0] Edit model list"
+        echo "=========================================="
+
+        read -r -p "Select an option (0-$keep_opt): " choice
+        echo
+
+        if [[ "$choice" == "0" ]]; then
+            edit_models
+            read_models
+        elif [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#MODELS[@]} )); then
+            SELECTED_MODEL="${MODELS[$((choice - 1))]}"
+            break
+        elif [[ "$choice" == "$keep_opt" ]]; then
+            KEEP_SESSION=true
+            break
+        else
+            read -r -p "Invalid selection. Press enter to try again." _
+        fi
+    done
+}
+
+show_status() {
+    printf 'Config: %s\n' "$CONFIG_FILE"
+    printf 'Models: %s\n' "$MODELS_FILE"
+    printf 'Remote: %s@%s:%s\n' "${WINDOWS_USER:-<unset>}" "${WINDOWS_HOST:-<unset>}" "$SSH_PORT"
+    printf 'Tunnel: localhost:%s -> %s:%s\n' "$LOCAL_PORT" "$REMOTE_HOST" "$REMOTE_PORT"
+    printf 'Target tag: %s\n' "$TARGET_TAG"
+    printf 'Tracked model: %s\n' "$(current_model)"
+    if is_tunnel_active; then
+        printf 'Tunnel status: active\n'
+    else
+        printf 'Tunnel status: inactive\n'
+    fi
+}
+
+open_tunnel() {
+    if is_tunnel_active; then
+        info "Connection already active. Ready to use."
+        return
+    fi
+
+    stop_local_ollama_if_needed
+    info "Opening SSH tunnel. Press Ctrl+C to close it."
+
+    (
+        for _ in {1..60}; do
+            if is_port_listening; then
+                printf '\nConnection successful. Ready to use.\n'
+                break
+            fi
+            sleep 0.5
+        done
+    ) &
+
+    local watcher_pid=$!
+    local -a cmd
+    readarray -d '' -t cmd < <(ssh_base)
+    cmd=(-N -L "${LOCAL_PORT}:${REMOTE_HOST}:${REMOTE_PORT}" "${cmd[@]:1}")
+    ssh "${cmd[@]}"
+    wait "$watcher_pid" 2>/dev/null || true
+}
+
+main() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --model)
+                [[ $# -ge 2 ]] || die "--model requires a value"
+                SELECTED_MODEL="$2"
+                shift 2
+                ;;
+            --keep)
+                KEEP_SESSION=true
+                shift
+                ;;
+            --edit-models)
+                load_config
+                edit_models
+                exit 0
+                ;;
+            --status)
+                load_config
+                show_status
+                exit 0
+                ;;
+            --init-config)
+                write_default_config
+                exit 0
+                ;;
+            --yes)
+                ASSUME_YES=true
+                shift
+                ;;
+            --no-stop-local-ollama)
+                STOP_LOCAL_OLLAMA_OVERRIDE="no"
+                shift
+                ;;
+            --help|-h)
+                usage
+                exit 0
+                ;;
+            --version)
+                printf '%s\n' "$VERSION"
+                exit 0
+                ;;
+            *)
+                die "unknown option: $1"
+                ;;
+        esac
+    done
+
+    load_config
+    if [[ -n "$STOP_LOCAL_OLLAMA_OVERRIDE" ]]; then
+        STOP_LOCAL_OLLAMA="$STOP_LOCAL_OLLAMA_OVERRIDE"
+    fi
+    validate_config
+    require_command ssh
+    require_command ss
+    require_command pgrep
+
+    if [[ -n "$SELECTED_MODEL" ]]; then
+        validate_model_tag "$SELECTED_MODEL" "MODEL"
+    elif [[ "$KEEP_SESSION" != true ]]; then
+        choose_model
+    fi
+
+    if [[ "$KEEP_SESSION" != true && -n "$SELECTED_MODEL" ]]; then
+        if [[ "$SELECTED_MODEL" != "$(current_model)" ]]; then
+            info "Connecting to remote host to prepare model: $SELECTED_MODEL"
+            remote_ollama_swap "$SELECTED_MODEL"
+            printf '%s\n' "$SELECTED_MODEL" >"$STATE_FILE"
+        else
+            info "$SELECTED_MODEL is already the tracked model."
+        fi
+    else
+        info "Keeping current remote model configuration."
+    fi
+
+    open_tunnel
+}
+
+main "$@"
