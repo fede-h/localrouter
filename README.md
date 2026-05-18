@@ -59,7 +59,12 @@ STOP_LOCAL_OLLAMA="ask"
 SSH_OPTS="-o ServerAliveInterval=30 -o ExitOnForwardFailure=yes"
 RETRY_COUNT="3"
 RETRY_BACKOFF="2"
+PULL_TIMEOUT="1800"
+CACHE_TTL="60"
+WATCH_BACKOFF_MAX="30"
 ```
+
+Environment-variable overrides for any of these: prefix with `LOCALROUTER_` (e.g. `LOCALROUTER_PULL_TIMEOUT=3600 localrouter use big-model`).
 
 Edit model choices in `~/.config/localrouter/models.list`, or use:
 
@@ -95,29 +100,42 @@ All remote operations (`--setup-windows`, `--setup-ssh-key`, `--model …`) are 
 
 ## Use
 
-Interactive selector:
+`localrouter` uses a `<verb> [args]` shape. Run with no arguments for the interactive selector.
 
 ```bash
-localrouter
+localrouter                              # interactive: pick a model + open tunnel
+localrouter use qwen2.5-coder:7b         # pull/cp + open tunnel for this model
+localrouter use qwen2.5-coder:7b --force # re-pull even if installed
+localrouter use --keep                   # open/reuse tunnel, no model swap
+localrouter list                         # configured models + installed status + size
+localrouter list --refresh               # bypass the cache
+localrouter status                       # remote, tunnel, last-tunnel/pull/use times
+localrouter kill                         # close any running localrouter tunnel
+localrouter restart                      # kill + reopen with the tracked model
+localrouter info qwen2.5-coder:7b        # ollama metadata for the model
+localrouter watch                        # foreground supervisor: auto-reconnect on drop
 ```
 
-Prepare a model and open the tunnel:
+Pre-checks and timeouts: before any pull, `localrouter` runs `ollama list` over SSH as a fast preflight (skip with `--no-preflight`). If the model is already installed it skips the pull (override with `--force`). The pull itself is wrapped in `timeout` (default 30 min; `--pull-timeout SECS` or `LOCALROUTER_PULL_TIMEOUT`).
 
-```bash
-localrouter --model qwen2.5-coder:7b-instruct-q4_K_M
-```
+Installed-model state is cached at `~/.local/state/localrouter/installed.cache` (60 s TTL by default; `LOCALROUTER_CACHE_TTL`). `--refresh` invalidates it.
 
-Keep the current remote model and only open or reuse the tunnel:
+Auto-reconnect: `localrouter watch` blocks the terminal, opens the tunnel, restarts it on drop with exponential backoff capped at `LOCALROUTER_WATCH_BACKOFF_MAX` (default 30 s). Ctrl+C exits cleanly. Run under `tmux`/`nohup` if you want it detached.
 
-```bash
-localrouter --keep
-```
+### Legacy flag aliases
 
-Show status:
+For backwards compatibility:
 
-```bash
-localrouter --status
-```
+| Legacy flag             | New verb                |
+|------------------------ |------------------------ |
+| `--model MODEL`         | `use MODEL`             |
+| `--status`              | `status`                |
+| `--setup`               | `setup`                 |
+| `--setup-windows`       | `setup windows`         |
+| `--setup-ssh-key`       | `setup ssh-key`         |
+| `--edit-models`         | `edit-models`           |
+| `--init-config`         | `init-config`           |
+| `--keep` (positional)   | `use --keep`            |
 
 ## Remote Requirements
 

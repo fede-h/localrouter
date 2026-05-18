@@ -10,7 +10,9 @@ CONFIG_DIR="$CONFIG_HOME/$APP_NAME"
 STATE_DIR="$STATE_HOME/$APP_NAME"
 CONFIG_FILE="$CONFIG_DIR/config"
 MODELS_FILE="$CONFIG_DIR/models.list"
-STATE_FILE="$STATE_DIR/current_model"
+STATE_FILE="$STATE_DIR/state"
+LEGACY_STATE_FILE="$STATE_DIR/current_model"
+CACHE_FILE="$STATE_DIR/installed.cache"
 
 WINDOWS_USER="${LOCALROUTER_WINDOWS_USER:-}"
 WINDOWS_HOST="${LOCALROUTER_WINDOWS_HOST:-}"
@@ -23,11 +25,24 @@ STOP_LOCAL_OLLAMA="${LOCALROUTER_STOP_LOCAL_OLLAMA:-ask}"
 SSH_OPTS="${LOCALROUTER_SSH_OPTS:-}"
 RETRY_COUNT="${LOCALROUTER_RETRIES:-3}"
 RETRY_BACKOFF="${LOCALROUTER_RETRY_BACKOFF:-2}"
+PULL_TIMEOUT="${LOCALROUTER_PULL_TIMEOUT:-1800}"
+CACHE_TTL="${LOCALROUTER_CACHE_TTL:-60}"
+WATCH_BACKOFF_MAX="${LOCALROUTER_WATCH_BACKOFF_MAX:-30}"
+PREFLIGHT_OLLAMA="${LOCALROUTER_PREFLIGHT:-1}"
 
 ASSUME_YES=false
 KEEP_SESSION=false
 SELECTED_MODEL=""
 STOP_LOCAL_OLLAMA_OVERRIDE=""
+FORCE_PULL=false
+FORCE_REFRESH=false
+
+COLOR_RESET=""
+COLOR_GREEN=""
+COLOR_YELLOW=""
+COLOR_BOLD=""
+COLOR_DIM=""
+COLOR_RED=""
 
 usage() {
     cat <<EOF
@@ -36,32 +51,49 @@ $APP_NAME $VERSION
 Bridge a local Ollama client to an Ollama server reachable over SSH.
 
 Usage:
-  $APP_NAME [--model MODEL] [--keep] [--edit-models] [--status]
-  $APP_NAME --setup | --setup-windows | --setup-ssh-key
-  $APP_NAME --init-config
+  $APP_NAME [global-opts] <verb> [args]
+  $APP_NAME                          (interactive: pick a model + open tunnel)
 
-Options:
-  --model MODEL          Pull/copy MODEL on the remote host before opening the tunnel.
-  --keep                 Open or keep the tunnel without changing the tracked model.
-  --edit-models          Edit the local model list interactively.
-  --status               Show current config, tracked model, and tunnel state.
-  --setup                Interactive wizard to write/update $CONFIG_FILE (user, host, ports, ...).
-  --setup-windows        Bootstrap the Windows host over SSH (sshd autostart, firewall, ollama check).
-  --setup-ssh-key        Generate a per-host ed25519 key and install it on Windows for passwordless SSH.
-  --retries N            Override remote retry count (default 3; LOCALROUTER_RETRIES).
-  --init-config          Create config and model-list files if they do not exist.
-  --yes                  Answer yes to local service prompts (also non-interactive setup).
-  --no-stop-local-ollama Do not offer to stop local ollama when it owns the port.
-  --help                 Show this help.
-  --version              Print the version.
+Verbs:
+  use MODEL                Pull/copy MODEL on the remote host then open the tunnel.
+  list                     Show configured models with installed status and size.
+  status                   Show config, tracked model, tunnel state, last-used timestamps.
+  kill                     Close any running localrouter SSH tunnel.
+  restart                  Kill the tunnel and reopen it with the tracked model.
+  info MODEL               Print ollama metadata (params/quant/template) for MODEL.
+  watch                    Foreground supervisor: auto-reconnect tunnel on drop.
+  setup                    Interactive config wizard for $CONFIG_FILE.
+  setup windows            Bootstrap the Windows host over SSH (sshd, firewall).
+  setup ssh-key            Generate and install a per-host SSH key for passwordless auth.
+  edit-models              Edit the local model list interactively.
+  init-config              Create config and model-list templates if missing.
 
-Config:
-  $CONFIG_FILE
-  $MODELS_FILE
+Global options:
+  --keep                   Open or keep the tunnel without changing the tracked model.
+  --force                  Force re-pull of the model even if already installed.
+  --refresh                Force refresh of the installed-models cache.
+  --no-preflight           Skip the 'ollama list' preflight before remote operations.
+  --retries N              Override remote retry count (default 3; LOCALROUTER_RETRIES).
+  --pull-timeout SECS      Override ollama-pull timeout (default 1800; LOCALROUTER_PULL_TIMEOUT).
+  --yes                    Answer yes to interactive prompts.
+  --no-stop-local-ollama   Do not offer to stop local ollama when it owns the port.
+  --help, -h               Show this help.
+  --version                Print the version.
 
-Required config values:
-  WINDOWS_USER
-  WINDOWS_HOST
+Legacy flag aliases (kept for backward compatibility):
+  --model MODEL  == use MODEL
+  --status       == status
+  --setup        == setup
+  --setup-windows == setup windows
+  --setup-ssh-key == setup ssh-key
+  --edit-models  == edit-models
+  --init-config  == init-config
+
+Config:    $CONFIG_FILE
+Models:    $MODELS_FILE
+State:     $STATE_FILE
+
+Required config values: WINDOWS_USER, WINDOWS_HOST
 EOF
 }
 
@@ -113,6 +145,136 @@ EOF
     fi
 }
 
+# ---- state file ----------------------------------------------------------
+# Format: key=value, single-quoted values. Bash-sourceable.
+#   TRACKED_MODEL='qwen2.5-coder:7b'
+#   LAST_TUNNEL_AT='1716050000'
+#   LAST_PULL_AT='1716049000'
+#   LAST_USE_AT='1716050100'
+
+TRACKED_MODEL=""
+LAST_TUNNEL_AT=""
+LAST_PULL_AT=""
+LAST_USE_AT=""
+
+read_state() {
+    ensure_dirs
+    TRACKED_MODEL=""
+    LAST_TUNNEL_AT=""
+    LAST_PULL_AT=""
+    LAST_USE_AT=""
+    if [[ -f "$STATE_FILE" ]]; then
+        # shellcheck source=/dev/null
+        source "$STATE_FILE"
+    elif [[ -f "$LEGACY_STATE_FILE" ]]; then
+        TRACKED_MODEL="$(<"$LEGACY_STATE_FILE")"
+        TRACKED_MODEL="${TRACKED_MODEL%$'\n'}"
+        write_state
+        rm -f "$LEGACY_STATE_FILE"
+    fi
+}
+
+write_state() {
+    ensure_dirs
+    local tmp
+    tmp="$(mktemp "$STATE_DIR/.state.XXXXXX")" || die "could not create temp file in $STATE_DIR"
+    {
+        printf '# localrouter state (auto-managed)\n'
+        printf 'TRACKED_MODEL=%s\n' "$(quote_for_config "$TRACKED_MODEL")"
+        printf 'LAST_TUNNEL_AT=%s\n' "$(quote_for_config "$LAST_TUNNEL_AT")"
+        printf 'LAST_PULL_AT=%s\n'   "$(quote_for_config "$LAST_PULL_AT")"
+        printf 'LAST_USE_AT=%s\n'    "$(quote_for_config "$LAST_USE_AT")"
+    } >"$tmp"
+    chmod 600 "$tmp"
+    mv "$tmp" "$STATE_FILE"
+}
+
+state_set() {
+    read_state
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            TRACKED_MODEL) TRACKED_MODEL="$2" ;;
+            LAST_TUNNEL_AT) LAST_TUNNEL_AT="$2" ;;
+            LAST_PULL_AT) LAST_PULL_AT="$2" ;;
+            LAST_USE_AT) LAST_USE_AT="$2" ;;
+            *) die "unknown state key: $1" ;;
+        esac
+        shift 2
+    done
+    write_state
+}
+
+# ---- installed-models cache ---------------------------------------------
+# Format: tab-separated <tag>\t<id>\t<size>\t<modified>
+
+cache_age() {
+    if [[ ! -f "$CACHE_FILE" ]]; then
+        printf '%d' "$((10**9))"
+        return
+    fi
+    local now mtime
+    now="$(date +%s)"
+    mtime="$(stat -c %Y "$CACHE_FILE" 2>/dev/null || stat -f %m "$CACHE_FILE" 2>/dev/null || echo 0)"
+    printf '%d' "$((now - mtime))"
+}
+
+cache_invalidate() {
+    rm -f "$CACHE_FILE"
+}
+
+parse_ollama_list() {
+    awk 'NR > 1 && NF > 0 {
+        name=$1
+        id=$2
+        size=$3 " " $4
+        modified=""
+        for (i=5; i<=NF; i++) modified = (modified == "" ? $i : modified " " $i)
+        printf "%s\t%s\t%s\t%s\n", name, id, size, modified
+    }'
+}
+
+_run_remote_list() {
+    local -a cmd
+    readarray -d '' -t cmd < <(ssh_base)
+    cmd+=(-o BatchMode=yes "ollama list")
+    "${cmd[@]}"
+}
+
+refresh_installed_cache() {
+    local raw parsed
+    raw="$(with_retries "ollama list" _run_remote_list)" || return 1
+    parsed="$(printf '%s\n' "$raw" | parse_ollama_list)"
+    ensure_dirs
+    local tmp
+    tmp="$(mktemp "$STATE_DIR/.cache.XXXXXX")" || die "could not create temp file in $STATE_DIR"
+    printf '%s\n' "$parsed" >"$tmp"
+    chmod 600 "$tmp"
+    mv "$tmp" "$CACHE_FILE"
+}
+
+ensure_installed_cache() {
+    if [[ "$FORCE_REFRESH" == true ]] || (( $(cache_age) > CACHE_TTL )); then
+        refresh_installed_cache
+    fi
+}
+
+installed_tags() {
+    [[ -f "$CACHE_FILE" ]] || return 0
+    awk -F '\t' '{print $1}' "$CACHE_FILE"
+}
+
+is_installed() {
+    local tag="$1"
+    [[ -f "$CACHE_FILE" ]] || return 1
+    awk -F '\t' -v t="$tag" '$1 == t {found=1; exit} END {exit !found}' "$CACHE_FILE"
+}
+
+installed_size() {
+    local tag="$1"
+    [[ -f "$CACHE_FILE" ]] || return 1
+    awk -F '\t' -v t="$tag" '$1 == t {print $3; exit}' "$CACHE_FILE"
+}
+
 load_config() {
     ensure_dirs
     if [[ -f "$CONFIG_FILE" ]]; then
@@ -131,6 +293,22 @@ load_config() {
     SSH_OPTS="${LOCALROUTER_SSH_OPTS:-${SSH_OPTS:-}}"
     RETRY_COUNT="${LOCALROUTER_RETRIES:-${RETRY_COUNT:-3}}"
     RETRY_BACKOFF="${LOCALROUTER_RETRY_BACKOFF:-${RETRY_BACKOFF:-2}}"
+    PULL_TIMEOUT="${LOCALROUTER_PULL_TIMEOUT:-${PULL_TIMEOUT:-1800}}"
+    CACHE_TTL="${LOCALROUTER_CACHE_TTL:-${CACHE_TTL:-60}}"
+    WATCH_BACKOFF_MAX="${LOCALROUTER_WATCH_BACKOFF_MAX:-${WATCH_BACKOFF_MAX:-30}}"
+    PREFLIGHT_OLLAMA="${LOCALROUTER_PREFLIGHT:-${PREFLIGHT_OLLAMA:-1}}"
+}
+
+setup_colors() {
+    if [[ "${NO_COLOR:-}" != "" ]] || [[ ! -t 1 ]]; then
+        return
+    fi
+    COLOR_RESET=$'\033[0m'
+    COLOR_GREEN=$'\033[32m'
+    COLOR_YELLOW=$'\033[33m'
+    COLOR_BOLD=$'\033[1m'
+    COLOR_DIM=$'\033[2m'
+    COLOR_RED=$'\033[31m'
 }
 
 validate_port() {
@@ -230,12 +408,33 @@ shell_quote() {
     printf "'%s'" "${value//\'/\'\\\'\'}"
 }
 
-_run_remote_ollama_swap() {
+_run_remote_pull() {
+    local quoted_model="$1"
+    local -a cmd
+    readarray -d '' -t cmd < <(ssh_base)
+    cmd+=("ollama pull $quoted_model")
+    if command -v timeout >/dev/null 2>&1; then
+        timeout "$PULL_TIMEOUT" "${cmd[@]}"
+    else
+        "${cmd[@]}"
+    fi
+}
+
+_run_remote_cp() {
     local quoted_model="$1" quoted_target="$2"
     local -a cmd
     readarray -d '' -t cmd < <(ssh_base)
-    cmd+=("ollama pull $quoted_model && ollama cp $quoted_model $quoted_target")
+    cmd+=("ollama cp $quoted_model $quoted_target")
     "${cmd[@]}"
+}
+
+preflight_ollama() {
+    if [[ "$PREFLIGHT_OLLAMA" != "1" ]]; then
+        return 0
+    fi
+    if ! ( refresh_installed_cache ) 2>/dev/null; then
+        die "preflight failed: could not run 'ollama list' on $WINDOWS_USER@$WINDOWS_HOST. Is Ollama running on Windows? Try: ssh $WINDOWS_USER@$WINDOWS_HOST 'ollama list'"
+    fi
 }
 
 remote_ollama_swap() {
@@ -244,7 +443,24 @@ remote_ollama_swap() {
     validate_model_tag "$model" "MODEL"
     quoted_model="$(shell_quote "$model")"
     quoted_target="$(shell_quote "$TARGET_TAG")"
-    with_retries "ollama pull/cp" _run_remote_ollama_swap "$quoted_model" "$quoted_target"
+
+    preflight_ollama
+
+    if [[ "$FORCE_PULL" != true ]] && is_installed "$model"; then
+        info "${COLOR_GREEN}*${COLOR_RESET} ${model} already installed on $WINDOWS_HOST; skipping pull (use --force to re-pull)"
+    else
+        [[ "$FORCE_PULL" == true ]] && info "Force-pulling $model"
+        info "Pulling $model (timeout ${PULL_TIMEOUT}s)"
+        with_retries "ollama pull" _run_remote_pull "$quoted_model"
+        state_set LAST_PULL_AT "$(date +%s)"
+        cache_invalidate
+    fi
+
+    if [[ "$model" != "$TARGET_TAG" ]]; then
+        info "Copying $model -> $TARGET_TAG"
+        with_retries "ollama cp" _run_remote_cp "$quoted_model" "$quoted_target"
+        cache_invalidate
+    fi
 }
 
 is_tunnel_active() {
@@ -379,8 +595,9 @@ edit_models() {
 }
 
 current_model() {
-    if [[ -f "$STATE_FILE" ]]; then
-        cat "$STATE_FILE"
+    read_state
+    if [[ -n "$TRACKED_MODEL" ]]; then
+        printf '%s' "$TRACKED_MODEL"
     else
         printf 'Unknown'
     fi
@@ -388,8 +605,9 @@ current_model() {
 
 choose_model() {
     read_models
-    local current keep_opt choice i
+    local current keep_opt refresh_opt choice i tag color label size
     current="$(current_model)"
+    ( ensure_installed_cache ) 2>/dev/null || info "(warning: could not refresh installed-models cache; menu will not mark installed state)"
     while true; do
         clear
         echo "=========================================="
@@ -397,9 +615,9 @@ choose_model() {
         echo "=========================================="
         echo "Remote: $WINDOWS_USER@$WINDOWS_HOST:$SSH_PORT"
         echo "Tunnel: localhost:$LOCAL_PORT -> $REMOTE_HOST:$REMOTE_PORT"
-        echo "Tracked model: $current"
+        echo "Tracked model: ${COLOR_BOLD}${current}${COLOR_RESET}"
         if is_tunnel_active; then
-            echo "Status: active tunnel detected"
+            echo "Status: ${COLOR_GREEN}active tunnel detected${COLOR_RESET}"
         else
             echo "Status: disconnected"
         fi
@@ -408,19 +626,33 @@ choose_model() {
             echo " (No models available. Press 0 to edit list)"
         else
             for i in "${!MODELS[@]}"; do
-                if [[ "${MODELS[$i]}" == "$current" ]]; then
-                    echo " [$((i + 1))] ${MODELS[$i]} (tracked)"
+                tag="${MODELS[$i]}"
+                if is_installed "$tag"; then
+                    color="$COLOR_GREEN"
+                    label="installed"
+                    size="$(installed_size "$tag" 2>/dev/null || true)"
+                    [[ -n "$size" ]] && label="$label, $size"
                 else
-                    echo " [$((i + 1))] ${MODELS[$i]}"
+                    color="$COLOR_YELLOW"
+                    label="not pulled"
+                fi
+                if [[ "$tag" == "$current" ]]; then
+                    printf ' [%d] %b%s%b  %b[%s, tracked]%b\n' \
+                        "$((i + 1))" "$COLOR_BOLD" "$tag" "$COLOR_RESET" "$color" "$label" "$COLOR_RESET"
+                else
+                    printf ' [%d] %s  %b[%s]%b\n' \
+                        "$((i + 1))" "$tag" "$color" "$label" "$COLOR_RESET"
                 fi
             done
         fi
         keep_opt=$((${#MODELS[@]} + 1))
+        refresh_opt=$((${#MODELS[@]} + 2))
         echo " [$keep_opt] Keep current session"
+        echo " [$refresh_opt] Refresh installed list"
         echo " [0] Edit model list"
         echo "=========================================="
 
-        read -r -p "Select an option (0-$keep_opt): " choice
+        read -r -p "Select an option (0-$refresh_opt): " choice
         echo
 
         if [[ "$choice" == "0" ]]; then
@@ -432,6 +664,10 @@ choose_model() {
         elif [[ "$choice" == "$keep_opt" ]]; then
             KEEP_SESSION=true
             break
+        elif [[ "$choice" == "$refresh_opt" ]]; then
+            FORCE_REFRESH=true
+            ( ensure_installed_cache ) 2>/dev/null || info "(refresh failed)"
+            FORCE_REFRESH=false
         else
             read -r -p "Invalid selection. Press enter to try again." _
         fi
@@ -817,6 +1053,7 @@ run_setup_windows() {
 open_tunnel() {
     if is_tunnel_active; then
         info "Connection already active. Ready to use."
+        state_set LAST_TUNNEL_AT "$(date +%s)"
         return
     fi
 
@@ -827,6 +1064,7 @@ open_tunnel() {
         for _ in {1..60}; do
             if is_port_listening; then
                 printf '\nConnection successful. Ready to use.\n'
+                state_set LAST_TUNNEL_AT "$(date +%s)" 2>/dev/null || true
                 break
             fi
             sleep 0.5
@@ -841,75 +1079,224 @@ open_tunnel() {
     wait "$watcher_pid" 2>/dev/null || true
 }
 
-main() {
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            --model)
-                [[ $# -ge 2 ]] || die "--model requires a value"
-                SELECTED_MODEL="$2"
-                shift 2
-                ;;
-            --keep)
-                KEEP_SESSION=true
-                shift
-                ;;
-            --edit-models)
-                load_config
-                edit_models
-                exit 0
-                ;;
-            --status)
-                load_config
-                show_status
-                exit 0
-                ;;
-            --init-config)
-                write_default_config
-                exit 0
-                ;;
-            --setup)
-                run_setup
-                exit 0
-                ;;
-            --setup-windows)
-                run_setup_windows
-                exit 0
-                ;;
-            --setup-ssh-key)
-                run_setup_ssh_key
-                exit 0
-                ;;
-            --retries)
-                [[ $# -ge 2 ]] || die "--retries requires a value"
-                RETRY_COUNT="$2"
-                shift 2
-                ;;
-            --yes)
-                ASSUME_YES=true
-                shift
-                ;;
-            --no-stop-local-ollama)
-                STOP_LOCAL_OLLAMA_OVERRIDE="no"
-                shift
-                ;;
-            --help|-h)
-                usage
-                exit 0
-                ;;
-            --version)
-                printf '%s\n' "$VERSION"
-                exit 0
-                ;;
-            *)
-                die "unknown option: $1"
-                ;;
-        esac
+# ---- new verb commands --------------------------------------------------
+
+format_relative_time() {
+    local epoch="$1"
+    if [[ -z "$epoch" || "$epoch" == "0" ]]; then
+        printf 'never'
+        return
+    fi
+    local now diff
+    now="$(date +%s)"
+    diff=$((now - epoch))
+    local rel
+    if   (( diff < 60 ));    then rel="${diff}s ago"
+    elif (( diff < 3600 ));  then rel="$((diff / 60))m ago"
+    elif (( diff < 86400 )); then rel="$((diff / 3600))h ago"
+    elif (( diff < 604800 ));then rel="$((diff / 86400))d ago"
+    else                          rel="$((diff / 604800))w ago"
+    fi
+    local abs
+    abs="$(date -d "@$epoch" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || date -r "$epoch" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || printf '%s' "$epoch")"
+    printf '%s (%s)' "$rel" "$abs"
+}
+
+cmd_status() {
+    load_config
+    read_state
+    local cache_status
+    if [[ -f "$CACHE_FILE" ]]; then
+        cache_status="$(cache_age)s old ($(wc -l <"$CACHE_FILE") models)"
+    else
+        cache_status="empty"
+    fi
+    printf 'Config:        %s\n' "$CONFIG_FILE"
+    printf 'Models:        %s\n' "$MODELS_FILE"
+    printf 'State:         %s\n' "$STATE_FILE"
+    printf 'Remote:        %s@%s:%s\n' "${WINDOWS_USER:-<unset>}" "${WINDOWS_HOST:-<unset>}" "$SSH_PORT"
+    printf 'Tunnel:        localhost:%s -> %s:%s\n' "$LOCAL_PORT" "$REMOTE_HOST" "$REMOTE_PORT"
+    printf 'Target tag:    %s\n' "$TARGET_TAG"
+    printf 'Tracked model: %s\n' "${TRACKED_MODEL:-Unknown}"
+    if is_tunnel_active; then
+        printf 'Tunnel status: %bactive%b\n' "$COLOR_GREEN" "$COLOR_RESET"
+    else
+        printf 'Tunnel status: inactive\n'
+    fi
+    printf 'Last tunnel:   %s\n' "$(format_relative_time "$LAST_TUNNEL_AT")"
+    printf 'Last pull:     %s\n' "$(format_relative_time "$LAST_PULL_AT")"
+    printf 'Last use:      %s\n' "$(format_relative_time "$LAST_USE_AT")"
+    printf 'Cache:         %s\n' "$cache_status"
+    printf 'Retries:       %d (backoff %ds, pull timeout %ds)\n' "$RETRY_COUNT" "$RETRY_BACKOFF" "$PULL_TIMEOUT"
+}
+
+cmd_list() {
+    load_config
+    validate_config
+    require_command ssh
+    ( ensure_installed_cache ) 2>/dev/null || info "(warning: could not query remote; showing configured models only)"
+    read_models
+    read_state
+
+    local tag installed_text size_text mark color status_padded
+    printf '\n%bConfigured models%b (%d):\n' "$COLOR_BOLD" "$COLOR_RESET" "${#MODELS[@]}"
+    printf '  %-46s  %-12s  %-10s  %s\n' "TAG" "STATUS" "SIZE" "TRACKED"
+    for tag in "${MODELS[@]}"; do
+        if is_installed "$tag"; then
+            color="$COLOR_GREEN"; installed_text="installed"
+            size_text="$(installed_size "$tag")"
+        else
+            color="$COLOR_YELLOW"; installed_text="not pulled"
+            size_text="-"
+        fi
+        mark=""
+        [[ -n "$TRACKED_MODEL" && "$tag" == "$TRACKED_MODEL" ]] && mark="*"
+        status_padded="$(printf '%-12s' "$installed_text")"
+        printf '  %-46s  %b%s%b  %-10s  %s\n' \
+            "$tag" "$color" "$status_padded" "$COLOR_RESET" "$size_text" "$mark"
     done
 
-    load_config
-    if [[ -n "$STOP_LOCAL_OLLAMA_OVERRIDE" ]]; then
-        STOP_LOCAL_OLLAMA="$STOP_LOCAL_OLLAMA_OVERRIDE"
+    if [[ -f "$CACHE_FILE" ]]; then
+        declare -A known_set=()
+        for tag in "${MODELS[@]}"; do known_set["$tag"]=1; done
+        local orphans=() orphan_sizes=() raw_tag raw_id raw_size raw_mod
+        while IFS=$'\t' read -r raw_tag raw_id raw_size raw_mod; do
+            [[ -z "$raw_tag" ]] && continue
+            if [[ -z "${known_set[$raw_tag]:-}" ]]; then
+                orphans+=("$raw_tag")
+                orphan_sizes+=("$raw_size")
+            fi
+        done <"$CACHE_FILE"
+        if (( ${#orphans[@]} > 0 )); then
+            printf '\n%bInstalled on %s but not in your list%b (%d):\n' \
+                "$COLOR_DIM" "$WINDOWS_HOST" "$COLOR_RESET" "${#orphans[@]}"
+            local i
+            for i in "${!orphans[@]}"; do
+                printf '  %-46s  %s\n' "${orphans[$i]}" "${orphan_sizes[$i]}"
+            done
+        fi
     fi
+    echo
+}
+
+tunnel_pids() {
+    pgrep -f "ssh .* -L ${LOCAL_PORT}:${REMOTE_HOST}:${REMOTE_PORT}" 2>/dev/null || true
+}
+
+cmd_kill() {
+    load_config
+    require_command pgrep
+    local pids
+    pids="$(tunnel_pids)"
+    if [[ -z "$pids" ]]; then
+        info "No localrouter tunnel running for localhost:$LOCAL_PORT -> $REMOTE_HOST:$REMOTE_PORT"
+        return 0
+    fi
+    info "Sending SIGTERM to: $pids"
+    # shellcheck disable=SC2086
+    kill -TERM $pids 2>/dev/null || true
+    local i
+    for i in {1..10}; do
+        sleep 0.5
+        pids="$(tunnel_pids)"
+        [[ -z "$pids" ]] && { info "Tunnel closed."; return 0; }
+    done
+    info "Tunnel did not exit after 5s; escalating to SIGKILL: $pids"
+    # shellcheck disable=SC2086
+    kill -KILL $pids 2>/dev/null || true
+    sleep 0.5
+    pids="$(tunnel_pids)"
+    if [[ -z "$pids" ]]; then
+        info "Tunnel killed."
+    else
+        die "could not kill tunnel pid(s): $pids"
+    fi
+}
+
+cmd_restart() {
+    load_config
+    validate_config
+    read_state
+    cmd_kill
+    if [[ -n "$TRACKED_MODEL" ]]; then
+        info "Reopening tunnel with tracked model: $TRACKED_MODEL"
+        KEEP_SESSION=true
+        SELECTED_MODEL="$TRACKED_MODEL"
+        cmd_use_run
+    else
+        info "No tracked model; opening tunnel without model swap"
+        KEEP_SESSION=true
+        cmd_use_run
+    fi
+}
+
+_run_remote_show() {
+    local quoted_model="$1"
+    local -a cmd
+    readarray -d '' -t cmd < <(ssh_base)
+    cmd+=("ollama show $quoted_model")
+    "${cmd[@]}"
+}
+
+cmd_info() {
+    [[ -n "${1:-}" ]] || die "usage: localrouter info MODEL"
+    local model="$1"
+    validate_model_tag "$model" "MODEL"
+    load_config
+    validate_config
+    require_command ssh
+    local quoted_model
+    quoted_model="$(shell_quote "$model")"
+    if is_installed "$model"; then
+        printf '%b%s%b — %s\n\n' "$COLOR_BOLD" "$model" "$COLOR_RESET" "installed, $(installed_size "$model" 2>/dev/null || echo unknown)"
+    else
+        printf '%b%s%b — %bnot installed on %s%b\n\n' "$COLOR_BOLD" "$model" "$COLOR_RESET" "$COLOR_YELLOW" "$WINDOWS_HOST" "$COLOR_RESET"
+    fi
+    with_retries "ollama show" _run_remote_show "$quoted_model"
+}
+
+cmd_watch() {
+    load_config
+    validate_config
+    require_command ssh
+    require_command ss
+    require_command pgrep
+
+    local backoff=1 rc last_up now uptime
+    trap 'info ""; info "Watch mode exiting."; exit 0' INT TERM
+
+    info "${COLOR_BOLD}watch${COLOR_RESET}: $WINDOWS_USER@$WINDOWS_HOST:$SSH_PORT (Ctrl+C to exit)"
+    while true; do
+        if is_tunnel_active; then
+            info "[watch] tunnel already running; sleeping until it drops"
+            while is_tunnel_active; do sleep 5; done
+            info "[watch] tunnel dropped"
+            backoff=1
+            continue
+        fi
+        last_up="$(date +%s)"
+        info "[watch] $(date '+%H:%M:%S') opening tunnel"
+        local -a cmd
+        readarray -d '' -t cmd < <(ssh_base)
+        cmd=(-N -L "${LOCAL_PORT}:${REMOTE_HOST}:${REMOTE_PORT}" "${cmd[@]:1}")
+        rc=0
+        ssh "${cmd[@]}" || rc=$?
+        now="$(date +%s)"
+        uptime=$((now - last_up))
+        state_set LAST_TUNNEL_AT "$last_up" 2>/dev/null || true
+        info "[watch] tunnel exited rc=$rc after ${uptime}s"
+        if (( uptime > 120 )); then
+            backoff=1
+        else
+            backoff=$(( backoff * 2 ))
+            (( backoff > WATCH_BACKOFF_MAX )) && backoff="$WATCH_BACKOFF_MAX"
+        fi
+        info "[watch] reconnecting in ${backoff}s"
+        sleep "$backoff"
+    done
+}
+
+cmd_use_run() {
     validate_config
     require_command ssh
     require_command ss
@@ -921,11 +1308,13 @@ main() {
         choose_model
     fi
 
+    state_set LAST_USE_AT "$(date +%s)"
+
     if [[ "$KEEP_SESSION" != true && -n "$SELECTED_MODEL" ]]; then
-        if [[ "$SELECTED_MODEL" != "$(current_model)" ]]; then
+        if [[ "$SELECTED_MODEL" != "${TRACKED_MODEL:-}" || "$FORCE_PULL" == true ]]; then
             info "Connecting to remote host to prepare model: $SELECTED_MODEL"
             remote_ollama_swap "$SELECTED_MODEL"
-            printf '%s\n' "$SELECTED_MODEL" >"$STATE_FILE"
+            state_set TRACKED_MODEL "$SELECTED_MODEL"
         else
             info "$SELECTED_MODEL is already the tracked model."
         fi
@@ -934,6 +1323,113 @@ main() {
     fi
 
     open_tunnel
+}
+
+cmd_use() {
+    if [[ $# -gt 0 ]]; then
+        SELECTED_MODEL="$1"
+        shift
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --keep) KEEP_SESSION=true; shift ;;
+                --force) FORCE_PULL=true; shift ;;
+                *) die "unknown option to 'use': $1" ;;
+            esac
+        done
+    fi
+    load_config
+    read_state
+    cmd_use_run
+}
+
+cmd_setup() {
+    local sub="${1:-}"
+    case "$sub" in
+        "")              run_setup ;;
+        windows)         shift || true; run_setup_windows ;;
+        ssh-key|sshkey)  shift || true; run_setup_ssh_key ;;
+        *) die "unknown 'setup' subcommand: $sub (use: setup | setup windows | setup ssh-key)" ;;
+    esac
+}
+
+apply_global_flag() {
+    case "$1" in
+        --retries)              [[ -n "${2:-}" ]] || die "--retries requires a value"; RETRY_COUNT="$2"; return 2 ;;
+        --pull-timeout)         [[ -n "${2:-}" ]] || die "--pull-timeout requires a value"; PULL_TIMEOUT="$2"; return 2 ;;
+        --yes)                  ASSUME_YES=true; return 1 ;;
+        --no-stop-local-ollama) STOP_LOCAL_OLLAMA_OVERRIDE="no"; return 1 ;;
+        --force)                FORCE_PULL=true; return 1 ;;
+        --refresh)              FORCE_REFRESH=true; return 1 ;;
+        --no-preflight)         PREFLIGHT_OLLAMA=0; return 1 ;;
+        --keep)                 KEEP_SESSION=true; return 1 ;;
+        --host)                 [[ -n "${2:-}" ]] || die "--host requires a value"
+                                info "warning: --host is reserved for future multi-host support and is currently a no-op"
+                                return 2 ;;
+        --help|-h)              usage; exit 0 ;;
+        --version)              printf '%s\n' "$VERSION"; exit 0 ;;
+        *)                      return 0 ;;
+    esac
+}
+
+main() {
+    setup_colors
+
+    local verb=""
+    local -a verb_args=()
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            # legacy flag aliases for one-shot verbs
+            --model)
+                [[ $# -ge 2 ]] || die "--model requires a value"
+                verb="use"; verb_args=("$2"); shift 2 ;;
+            --status)            verb="status"; shift ;;
+            --setup)             verb="setup"; shift ;;
+            --setup-windows)     verb="setup"; verb_args=("windows"); shift ;;
+            --setup-ssh-key)     verb="setup"; verb_args=("ssh-key"); shift ;;
+            --edit-models)       verb="edit-models"; shift ;;
+            --init-config)       verb="init-config"; shift ;;
+            # positional verb: rest of argv belongs to it
+            use|list|status|kill|restart|info|watch|setup|edit-models|init-config|help|version)
+                verb="$1"; shift
+                while [[ $# -gt 0 ]]; do
+                    apply_global_flag "$1" "${2:-}"; local consumed=$?
+                    if   (( consumed == 1 )); then shift
+                    elif (( consumed == 2 )); then shift 2
+                    else verb_args+=("$1"); shift
+                    fi
+                done
+                break ;;
+            *)
+                apply_global_flag "$1" "${2:-}"; local consumed=$?
+                if   (( consumed == 1 )); then shift
+                elif (( consumed == 2 )); then shift 2
+                else die "unknown option or verb: $1"
+                fi ;;
+        esac
+    done
+
+    [[ "$verb" == "help" ]] && { usage; exit 0; }
+    [[ "$verb" == "version" ]] && { printf '%s\n' "$VERSION"; exit 0; }
+
+    load_config
+    if [[ -n "$STOP_LOCAL_OLLAMA_OVERRIDE" ]]; then
+        STOP_LOCAL_OLLAMA="$STOP_LOCAL_OLLAMA_OVERRIDE"
+    fi
+
+    case "$verb" in
+        ""|use)        cmd_use "${verb_args[@]}" ;;
+        list)          cmd_list ;;
+        status)        cmd_status ;;
+        kill)          cmd_kill ;;
+        restart)       cmd_restart ;;
+        info)          cmd_info "${verb_args[@]}" ;;
+        watch)         cmd_watch ;;
+        setup)         cmd_setup "${verb_args[@]}" ;;
+        edit-models)   edit_models ;;
+        init-config)   write_default_config ;;
+        *)             die "unknown verb: $verb" ;;
+    esac
 }
 
 main "$@"
