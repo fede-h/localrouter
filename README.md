@@ -29,13 +29,21 @@ PREFIX="$HOME/.local" ./install.sh
 
 ## Configure
 
-Create config files:
+The recommended path is the interactive wizard:
 
 ```bash
-localrouter --init-config
+localrouter --setup
 ```
 
-Edit `~/.config/localrouter/config`:
+It prompts for `WINDOWS_USER`, `WINDOWS_HOST`, SSH/local/remote ports, target tag, retry behaviour, and writes `~/.config/localrouter/config` atomically (0600). Each value is validated before being saved.
+
+For a non-interactive scaffold, use:
+
+```bash
+localrouter --init-config        # writes a commented config template
+```
+
+Either way you can edit `~/.config/localrouter/config` directly:
 
 ```bash
 WINDOWS_USER="your-windows-user"
@@ -49,6 +57,8 @@ REMOTE_PORT="11434"
 TARGET_TAG="qwen2.5-coder:7b"
 STOP_LOCAL_OLLAMA="ask"
 SSH_OPTS="-o ServerAliveInterval=30 -o ExitOnForwardFailure=yes"
+RETRY_COUNT="3"
+RETRY_BACKOFF="2"
 ```
 
 Edit model choices in `~/.config/localrouter/models.list`, or use:
@@ -56,6 +66,32 @@ Edit model choices in `~/.config/localrouter/models.list`, or use:
 ```bash
 localrouter --edit-models
 ```
+
+### Passwordless SSH
+
+```bash
+localrouter --setup-ssh-key
+```
+
+Generates `~/.ssh/localrouter_<host>` (ed25519, no passphrase), installs the public key on the Windows host (auto-detects whether the SSH user is an admin and writes to `%USERPROFILE%\.ssh\authorized_keys` or `C:\ProgramData\ssh\administrators_authorized_keys` accordingly), tightens ACLs with `icacls`, and merges `-i <key>` into `SSH_OPTS` so future commands skip the password prompt.
+
+### Bootstrap the Windows host
+
+```bash
+localrouter --setup-windows
+```
+
+Pipes a vetted, idempotent PowerShell script through your SSH session that:
+
+- ensures the `sshd` service is set to **Automatic** startup and is **Running**
+- sets any non-`Private` network connection profiles to `Private` (so the firewall rule applies on this network)
+- adds a firewall rule named `localrouter SSH inbound` allowing TCP `SSH_PORT` inbound on all profiles (only if a rule with that name does not already exist)
+- reports whether `ollama` is on the SSH user's `PATH`
+- reports whether `sshd` is listening on `SSH_PORT`
+
+It will **not** install OpenSSH Server itself — that needs to happen once on the Windows host with `Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0` (requires admin). Without it there is no SSH session to pipe through.
+
+All remote operations (`--setup-windows`, `--setup-ssh-key`, `--model …`) are wrapped in a retry loop. Override with `--retries N`, `LOCALROUTER_RETRIES`, or `LOCALROUTER_RETRY_BACKOFF` (seconds, linear). Default: 3 retries, 2s backoff.
 
 ## Use
 
@@ -100,13 +136,17 @@ This tool can touch privileged surfaces:
 - It may run `sudo systemctl stop ollama` locally if local Ollama owns the forwarded port.
 - It connects to a remote host over SSH.
 - It asks the remote host to run `ollama pull` and `ollama cp`.
+- `--setup-windows` asks the remote host to: change the `sshd` service start type, start `sshd`, set network connection profiles to `Private`, and create a Windows Firewall rule for `SSH_PORT`. Each of those steps is idempotent (checks current state before changing it) and the script is printed in `bin/localrouter` for inspection.
+- `--setup-ssh-key` writes to the remote `authorized_keys` (or `administrators_authorized_keys`) file and runs `icacls` to tighten its ACL.
 
-`localrouter` does not store passwords. Prefer SSH keys with passphrases and host-key verification. Do not disable SSH host-key checking in shared scripts or docs.
+`localrouter` does not store passwords. Prefer SSH keys with passphrases and host-key verification. Do not disable SSH host-key checking in shared scripts or docs. `--setup-ssh-key` generates a key with no passphrase by design (passwordless automation); only run it on hosts where that trade-off is acceptable.
 
-Model names and target tags are validated before being sent to the remote shell. Keep that validation strict if you add more remote operations.
+`WINDOWS_USER`, `WINDOWS_HOST`, ports, model names, and target tags are validated before being passed to `ssh` or PowerShell. Keep that validation strict if you add more remote operations.
 
 ## Current Limitations
 
-- Windows setup is documented only as requirements, not automated. The exact PowerShell commands for enabling OpenSSH, configuring firewall rules, and validating Ollama are still intentionally left for curation.
+- Installing the OpenSSH Server capability itself on Windows is still manual (chicken-and-egg with SSH connectivity).
 - The local port conflict handler only knows how to stop a systemd `ollama` service.
 - This is a Bash CLI for Linux/macOS clients. Native PowerShell client support is out of scope for now.
+- `--setup-ssh-key` generates a passphrase-less key; if you want a passphrase, generate the key manually and add `-i <path>` to `SSH_OPTS` yourself.
+- IPv6 literals in `WINDOWS_HOST` are not yet supported.

@@ -21,6 +21,8 @@ REMOTE_HOST="${LOCALROUTER_REMOTE_HOST:-localhost}"
 TARGET_TAG="${LOCALROUTER_TARGET_TAG:-qwen2.5-coder:7b}"
 STOP_LOCAL_OLLAMA="${LOCALROUTER_STOP_LOCAL_OLLAMA:-ask}"
 SSH_OPTS="${LOCALROUTER_SSH_OPTS:-}"
+RETRY_COUNT="${LOCALROUTER_RETRIES:-3}"
+RETRY_BACKOFF="${LOCALROUTER_RETRY_BACKOFF:-2}"
 
 ASSUME_YES=false
 KEEP_SESSION=false
@@ -35,6 +37,7 @@ Bridge a local Ollama client to an Ollama server reachable over SSH.
 
 Usage:
   $APP_NAME [--model MODEL] [--keep] [--edit-models] [--status]
+  $APP_NAME --setup | --setup-windows | --setup-ssh-key
   $APP_NAME --init-config
 
 Options:
@@ -42,8 +45,12 @@ Options:
   --keep                 Open or keep the tunnel without changing the tracked model.
   --edit-models          Edit the local model list interactively.
   --status               Show current config, tracked model, and tunnel state.
+  --setup                Interactive wizard to write/update $CONFIG_FILE (user, host, ports, ...).
+  --setup-windows        Bootstrap the Windows host over SSH (sshd autostart, firewall, ollama check).
+  --setup-ssh-key        Generate a per-host ed25519 key and install it on Windows for passwordless SSH.
+  --retries N            Override remote retry count (default 3; LOCALROUTER_RETRIES).
   --init-config          Create config and model-list files if they do not exist.
-  --yes                  Answer yes to local service prompts.
+  --yes                  Answer yes to local service prompts (also non-interactive setup).
   --no-stop-local-ollama Do not offer to stop local ollama when it owns the port.
   --help                 Show this help.
   --version              Print the version.
@@ -122,6 +129,8 @@ load_config() {
     TARGET_TAG="${LOCALROUTER_TARGET_TAG:-${TARGET_TAG:-qwen2.5-coder:7b}}"
     STOP_LOCAL_OLLAMA="${LOCALROUTER_STOP_LOCAL_OLLAMA:-${STOP_LOCAL_OLLAMA:-ask}}"
     SSH_OPTS="${LOCALROUTER_SSH_OPTS:-${SSH_OPTS:-}}"
+    RETRY_COUNT="${LOCALROUTER_RETRIES:-${RETRY_COUNT:-3}}"
+    RETRY_BACKOFF="${LOCALROUTER_RETRY_BACKOFF:-${RETRY_BACKOFF:-2}}"
 }
 
 validate_port() {
@@ -139,9 +148,27 @@ validate_model_tag() {
         || die "$name contains unsupported characters: $value"
 }
 
+validate_windows_user() {
+    local value="$1"
+    local name="$2"
+    [[ -n "$value" ]] || die "$name cannot be empty"
+    [[ "$value" =~ ^[A-Za-z_][A-Za-z0-9._-]{0,31}$ ]] \
+        || die "$name contains unsupported characters (allowed: letters, digits, dot, underscore, hyphen): $value"
+}
+
+validate_windows_host() {
+    local value="$1"
+    local name="$2"
+    [[ -n "$value" ]] || die "$name cannot be empty"
+    [[ "$value" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]{0,253}[A-Za-z0-9])?$ ]] \
+        || die "$name must be a hostname or IPv4 literal (IPv6 is not yet supported): $value"
+}
+
 validate_config() {
-    [[ -n "$WINDOWS_USER" ]] || die "WINDOWS_USER is not configured. Run '$APP_NAME --init-config' and edit $CONFIG_FILE."
-    [[ -n "$WINDOWS_HOST" ]] || die "WINDOWS_HOST is not configured. Run '$APP_NAME --init-config' and edit $CONFIG_FILE."
+    [[ -n "$WINDOWS_USER" ]] || die "WINDOWS_USER is not configured. Run '$APP_NAME --setup' or '$APP_NAME --init-config'."
+    [[ -n "$WINDOWS_HOST" ]] || die "WINDOWS_HOST is not configured. Run '$APP_NAME --setup' or '$APP_NAME --init-config'."
+    validate_windows_user "$WINDOWS_USER" "WINDOWS_USER"
+    validate_windows_host "$WINDOWS_HOST" "WINDOWS_HOST"
     validate_port "$SSH_PORT" "SSH_PORT"
     validate_port "$LOCAL_PORT" "LOCAL_PORT"
     validate_port "$REMOTE_PORT" "REMOTE_PORT"
@@ -154,6 +181,37 @@ validate_config() {
 
 require_command() {
     command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
+}
+
+validate_retry_args() {
+    [[ "$RETRY_COUNT" =~ ^[0-9]+$ ]] || die "RETRY_COUNT must be a non-negative integer"
+    [[ "$RETRY_BACKOFF" =~ ^[0-9]+$ ]] || die "RETRY_BACKOFF must be a non-negative integer (seconds)"
+}
+
+with_retries() {
+    local label="$1"
+    shift
+    validate_retry_args
+    local attempts=$((RETRY_COUNT + 1))
+    local i=1
+    local rc=0
+    while (( i <= attempts )); do
+        if (( attempts > 1 )); then
+            info "[$label] attempt $i/$attempts"
+        fi
+        rc=0
+        "$@" || rc=$?
+        if (( rc == 0 )); then
+            return 0
+        fi
+        if (( i < attempts )); then
+            local delay=$(( RETRY_BACKOFF * i ))
+            info "[$label] failed with exit $rc; retrying in ${delay}s"
+            sleep "$delay"
+        fi
+        ((i++))
+    done
+    die "$label failed after $attempts attempt(s) (last exit code: $rc)"
 }
 
 ssh_base() {
@@ -172,17 +230,21 @@ shell_quote() {
     printf "'%s'" "${value//\'/\'\\\'\'}"
 }
 
+_run_remote_ollama_swap() {
+    local quoted_model="$1" quoted_target="$2"
+    local -a cmd
+    readarray -d '' -t cmd < <(ssh_base)
+    cmd+=("ollama pull $quoted_model && ollama cp $quoted_model $quoted_target")
+    "${cmd[@]}"
+}
+
 remote_ollama_swap() {
     local model="$1"
     local quoted_model quoted_target
     validate_model_tag "$model" "MODEL"
     quoted_model="$(shell_quote "$model")"
     quoted_target="$(shell_quote "$TARGET_TAG")"
-
-    local -a cmd
-    readarray -d '' -t cmd < <(ssh_base)
-    cmd+=("ollama pull $quoted_model && ollama cp $quoted_model $quoted_target")
-    "${cmd[@]}"
+    with_retries "ollama pull/cp" _run_remote_ollama_swap "$quoted_model" "$quoted_target"
 }
 
 is_tunnel_active() {
@@ -390,6 +452,368 @@ show_status() {
     fi
 }
 
+quote_for_config() {
+    local v="$1"
+    printf "'%s'" "${v//\'/\'\\\'\'}"
+}
+
+write_config_atomic() {
+    local content="$1"
+    ensure_dirs
+    local tmp
+    tmp="$(mktemp "$CONFIG_DIR/.config.XXXXXX")" || die "could not create temp file in $CONFIG_DIR"
+    printf '%s' "$content" >"$tmp"
+    chmod 600 "$tmp"
+    mv "$tmp" "$CONFIG_FILE"
+}
+
+prompt_value() {
+    local label="$1" default="$2" input
+    if [[ -n "$default" ]]; then
+        read -r -p "$label [$default]: " input
+        printf '%s' "${input:-$default}"
+    else
+        read -r -p "$label: " input
+        printf '%s' "$input"
+    fi
+}
+
+build_config_content() {
+    cat <<EOF
+# localrouter config (managed by --setup; safe to edit by hand)
+WINDOWS_USER=$(quote_for_config "$WINDOWS_USER")
+WINDOWS_HOST=$(quote_for_config "$WINDOWS_HOST")
+SSH_PORT=$(quote_for_config "$SSH_PORT")
+LOCAL_PORT=$(quote_for_config "$LOCAL_PORT")
+REMOTE_HOST=$(quote_for_config "$REMOTE_HOST")
+REMOTE_PORT=$(quote_for_config "$REMOTE_PORT")
+TARGET_TAG=$(quote_for_config "$TARGET_TAG")
+STOP_LOCAL_OLLAMA=$(quote_for_config "$STOP_LOCAL_OLLAMA")
+SSH_OPTS=$(quote_for_config "$SSH_OPTS")
+RETRY_COUNT=$(quote_for_config "$RETRY_COUNT")
+RETRY_BACKOFF=$(quote_for_config "$RETRY_BACKOFF")
+EOF
+}
+
+run_setup() {
+    load_config
+    echo "=========================================="
+    echo "         localrouter first-time setup     "
+    echo "=========================================="
+    echo "Press Enter to keep the value in [brackets]. Ctrl+C to abort."
+    echo "------------------------------------------"
+
+    local val
+    while true; do
+        val="$(prompt_value "Windows username" "$WINDOWS_USER")"
+        if validate_windows_user "$val" "WINDOWS_USER" 2>/dev/null; then
+            WINDOWS_USER="$val"; break
+        else
+            echo "  -> invalid username (letters, digits, dot, underscore, hyphen; <=32 chars)"
+        fi
+    done
+    while true; do
+        val="$(prompt_value "Windows host (IP or DNS)" "$WINDOWS_HOST")"
+        if validate_windows_host "$val" "WINDOWS_HOST" 2>/dev/null; then
+            WINDOWS_HOST="$val"; break
+        else
+            echo "  -> invalid hostname or IPv4 literal"
+        fi
+    done
+    while true; do
+        val="$(prompt_value "SSH port" "${SSH_PORT:-22}")"
+        if validate_port "$val" "SSH_PORT" 2>/dev/null; then SSH_PORT="$val"; break; else echo "  -> port must be 1-65535"; fi
+    done
+    while true; do
+        val="$(prompt_value "Local port to bind on this machine" "${LOCAL_PORT:-11434}")"
+        if validate_port "$val" "LOCAL_PORT" 2>/dev/null; then LOCAL_PORT="$val"; break; else echo "  -> port must be 1-65535"; fi
+    done
+    REMOTE_HOST="$(prompt_value "Remote bind host (as seen from Windows)" "${REMOTE_HOST:-localhost}")"
+    while true; do
+        val="$(prompt_value "Remote port (Ollama on Windows)" "${REMOTE_PORT:-11434}")"
+        if validate_port "$val" "REMOTE_PORT" 2>/dev/null; then REMOTE_PORT="$val"; break; else echo "  -> port must be 1-65535"; fi
+    done
+    while true; do
+        val="$(prompt_value "Default target tag (alias Ollama uses after cp)" "${TARGET_TAG:-qwen2.5-coder:7b}")"
+        if validate_model_tag "$val" "TARGET_TAG" 2>/dev/null; then TARGET_TAG="$val"; break; else echo "  -> see docs for tag format"; fi
+    done
+    while true; do
+        val="$(prompt_value "Stop local ollama if it owns the port? (ask/yes/no)" "${STOP_LOCAL_OLLAMA:-ask}")"
+        case "$val" in ask|yes|no) STOP_LOCAL_OLLAMA="$val"; break ;; *) echo "  -> must be ask, yes, or no" ;; esac
+    done
+    SSH_OPTS="$(prompt_value "Extra SSH options (space-separated, optional)" "${SSH_OPTS:-}")"
+    while true; do
+        val="$(prompt_value "Retry count for remote ops" "${RETRY_COUNT:-3}")"
+        if [[ "$val" =~ ^[0-9]+$ ]]; then RETRY_COUNT="$val"; break; else echo "  -> must be a non-negative integer"; fi
+    done
+    while true; do
+        val="$(prompt_value "Retry backoff seconds (multiplied by attempt #)" "${RETRY_BACKOFF:-2}")"
+        if [[ "$val" =~ ^[0-9]+$ ]]; then RETRY_BACKOFF="$val"; break; else echo "  -> must be a non-negative integer"; fi
+    done
+
+    local content
+    content="$(build_config_content)"
+    write_config_atomic "$content"
+    info "Wrote $CONFIG_FILE"
+
+    if [[ ! -f "$MODELS_FILE" ]]; then
+        write_default_config >/dev/null
+    fi
+
+    if [[ "$ASSUME_YES" == true ]]; then return; fi
+    local answer
+    read -r -p "Test SSH connection to $WINDOWS_USER@$WINDOWS_HOST:$SSH_PORT now? [y/N] " answer
+    if [[ "$answer" =~ ^[Yy]$ ]]; then
+        local -a cmd
+        readarray -d '' -t cmd < <(ssh_base)
+        cmd+=(-o BatchMode=no -o ConnectTimeout=10 "echo ok")
+        if "${cmd[@]}"; then
+            info "SSH connection OK."
+        else
+            info "SSH test failed. If this is the first connection, accept the host key and try again; otherwise check credentials or firewall."
+        fi
+    fi
+}
+
+escape_ps_single() {
+    local v="$1"
+    printf '%s' "${v//\'/\'\'}"
+}
+
+_setup_ssh_key_ps_body() {
+    cat <<'PSEOF'
+$ErrorActionPreference = 'Continue'
+$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]'Administrator')
+if ($isAdmin) {
+    $sshDir = 'C:\ProgramData\ssh'
+    $authFile = Join-Path $sshDir 'administrators_authorized_keys'
+    $scope = 'administrators'
+} else {
+    $sshDir = Join-Path $env:USERPROFILE '.ssh'
+    $authFile = Join-Path $sshDir 'authorized_keys'
+    $scope = $env:USERNAME
+}
+Write-Output ("authorized_keys target: " + $authFile + " (scope: " + $scope + ")")
+
+if (!(Test-Path $sshDir)) {
+    New-Item -ItemType Directory -Path $sshDir -Force | Out-Null
+    Write-Output ("created directory: " + $sshDir)
+}
+if (!(Test-Path $authFile)) {
+    New-Item -ItemType File -Path $authFile -Force | Out-Null
+    Write-Output ("created file: " + $authFile)
+}
+
+$existing = @()
+if (Test-Path $authFile) { $existing = Get-Content $authFile -ErrorAction SilentlyContinue }
+if ($existing -contains $Pubkey) {
+    Write-Output "key already present; no change"
+} else {
+    Add-Content -Path $authFile -Value $Pubkey
+    Write-Output "key appended"
+}
+
+if ($isAdmin) {
+    icacls $authFile /inheritance:r | Out-Null
+    icacls $authFile /grant "Administrators:F" "SYSTEM:F" | Out-Null
+} else {
+    icacls $authFile /inheritance:r | Out-Null
+    icacls $authFile /grant "${scope}:F" | Out-Null
+}
+Write-Output "permissions tightened"
+PSEOF
+}
+
+_run_setup_ssh_key() {
+    local pubkey_escaped="$1"
+    local -a cmd
+    readarray -d '' -t cmd < <(ssh_base)
+    cmd+=(powershell -NoProfile -Command -)
+    {
+        printf "\$Pubkey = '%s'\n" "$pubkey_escaped"
+        _setup_ssh_key_ps_body
+    } | "${cmd[@]}"
+}
+
+run_setup_ssh_key() {
+    load_config
+    validate_config
+    require_command ssh
+    require_command ssh-keygen
+
+    local key_path="$HOME/.ssh/localrouter_${WINDOWS_HOST}"
+    mkdir -p "$HOME/.ssh"
+    chmod 700 "$HOME/.ssh"
+
+    if [[ ! -f "$key_path" ]]; then
+        info "Generating ed25519 key at $key_path (no passphrase)"
+        ssh-keygen -t ed25519 -N "" -C "localrouter@${WINDOWS_HOST}" -f "$key_path" >/dev/null
+    else
+        info "Key already exists: $key_path"
+    fi
+
+    local pubkey
+    pubkey="$(< "${key_path}.pub")"
+    pubkey="${pubkey%$'\n'}"
+    [[ -n "$pubkey" ]] || die "could not read $key_path.pub"
+
+    info "Installing public key on $WINDOWS_USER@$WINDOWS_HOST"
+    local pubkey_escaped
+    pubkey_escaped="$(escape_ps_single "$pubkey")"
+    with_retries "setup-ssh-key" _run_setup_ssh_key "$pubkey_escaped"
+
+    if [[ "$SSH_OPTS" != *"-i $key_path"* ]]; then
+        if [[ -n "$SSH_OPTS" ]]; then
+            SSH_OPTS="$SSH_OPTS -i $key_path"
+        else
+            SSH_OPTS="-i $key_path"
+        fi
+        write_config_atomic "$(build_config_content)"
+        info "Added '-i $key_path' to SSH_OPTS in $CONFIG_FILE"
+    else
+        info "SSH_OPTS already references $key_path"
+    fi
+
+    if [[ "$ASSUME_YES" != true ]]; then
+        local answer
+        read -r -p "Test passwordless SSH now? [y/N] " answer
+        if [[ "$answer" =~ ^[Yy]$ ]]; then
+            local -a cmd
+            readarray -d '' -t cmd < <(ssh_base)
+            cmd+=(-o BatchMode=yes -o ConnectTimeout=10 "echo ok")
+            if "${cmd[@]}"; then
+                info "Passwordless SSH OK."
+            else
+                info "Passwordless SSH failed. If the key was just installed and the host requires interactive admin elevation, try once more with a password. Otherwise check the authorized_keys path on Windows."
+            fi
+        fi
+    fi
+}
+
+_setup_windows_ps_body() {
+    cat <<'PSEOF'
+$ErrorActionPreference = 'Continue'
+$results = @{}
+
+function Note($key, $value) { $script:results[$key] = $value; Write-Output ("   {0,-30} {1}" -f $key, $value) }
+
+Write-Output "=========================================="
+Write-Output " localrouter -> Windows host bootstrap"
+Write-Output "=========================================="
+
+Write-Output "-> 1/5 OpenSSH Server service"
+$svc = Get-Service -Name sshd -ErrorAction SilentlyContinue
+if ($null -eq $svc) {
+    Note "sshd_service" "NOT INSTALLED (run on Windows: Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0)"
+    exit 2
+}
+if ($svc.StartType -ne 'Automatic') {
+    Set-Service -Name sshd -StartupType Automatic
+    Note "sshd_startup" "set to Automatic"
+} else {
+    Note "sshd_startup" "already Automatic"
+}
+if ($svc.Status -ne 'Running') {
+    Start-Service -Name sshd
+    Note "sshd_status" "started"
+} else {
+    Note "sshd_status" "already Running"
+}
+
+Write-Output "-> 2/5 Network profile"
+$nonPrivate = Get-NetConnectionProfile | Where-Object NetworkCategory -ne 'Private'
+if ($nonPrivate) {
+    foreach ($p in $nonPrivate) {
+        try {
+            Set-NetConnectionProfile -InterfaceIndex $p.InterfaceIndex -NetworkCategory Private
+            Note ("profile_" + $p.InterfaceAlias) "set Private"
+        } catch {
+            Note ("profile_" + $p.InterfaceAlias) ("FAILED: " + $_.Exception.Message)
+        }
+    }
+} else {
+    Note "profile" "all already Private"
+}
+
+Write-Output "-> 3/5 Firewall rule for SSH port $Port"
+$existing = Get-NetFirewallRule -DisplayName "localrouter SSH inbound" -ErrorAction SilentlyContinue
+if ($existing) {
+    Note "firewall_rule" "already present (localrouter SSH inbound)"
+} else {
+    try {
+        New-NetFirewallRule -DisplayName "localrouter SSH inbound" `
+            -Direction Inbound -Action Allow -Protocol TCP -LocalPort $Port `
+            -Profile Any -Enabled True | Out-Null
+        Note "firewall_rule" "created (TCP $Port inbound, all profiles)"
+    } catch {
+        Note "firewall_rule" ("FAILED: " + $_.Exception.Message)
+    }
+}
+
+Write-Output "-> 4/5 ollama on PATH for this SSH session"
+$ollama = Get-Command ollama -ErrorAction SilentlyContinue
+if ($ollama) {
+    Note "ollama_path" $ollama.Source
+} else {
+    Note "ollama_path" "NOT FOUND on PATH for SSH user; add Ollama install dir to System PATH"
+}
+
+Write-Output "-> 5/5 sshd listening on port $Port"
+$listening = (Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction SilentlyContinue)
+if ($listening) {
+    Note "sshd_listening" "yes"
+} else {
+    Note "sshd_listening" "no (sshd may be binding only on IPv6 or another port)"
+}
+
+Write-Output "=========================================="
+Write-Output " Bootstrap complete."
+Write-Output "=========================================="
+PSEOF
+}
+
+_run_setup_windows() {
+    local -a cmd
+    readarray -d '' -t cmd < <(ssh_base)
+    cmd+=(powershell -NoProfile -Command -)
+    {
+        printf '$Port = %d\n' "$SSH_PORT"
+        _setup_windows_ps_body
+    } | "${cmd[@]}"
+}
+
+run_setup_windows() {
+    load_config
+    validate_config
+    require_command ssh
+
+    echo "=========================================="
+    echo " localrouter --setup-windows"
+    echo "=========================================="
+    echo "Remote: $WINDOWS_USER@$WINDOWS_HOST:$SSH_PORT"
+    echo
+    echo "This will run idempotent PowerShell on the Windows host that:"
+    echo "  - sets the sshd service to Automatic startup and starts it"
+    echo "  - sets non-Private network profiles to Private (so the firewall rule applies)"
+    echo "  - adds (if missing) a firewall rule 'localrouter SSH inbound' allowing TCP $SSH_PORT"
+    echo "  - reports whether ollama is on the SSH user's PATH"
+    echo "  - reports whether sshd is listening on $SSH_PORT"
+    echo
+    echo "It will NOT install OpenSSH Server (do that once manually on Windows:"
+    echo "  Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0)"
+    echo
+    echo "Retries: $RETRY_COUNT (backoff ${RETRY_BACKOFF}s linear)."
+    echo
+    if [[ "$ASSUME_YES" != true ]]; then
+        local answer
+        read -r -p "Continue? [y/N] " answer
+        [[ "$answer" =~ ^[Yy]$ ]] || die "aborted by user"
+    fi
+
+    with_retries "setup-windows" _run_setup_windows
+    info "Done."
+}
+
 open_tunnel() {
     if is_tunnel_active; then
         info "Connection already active. Ready to use."
@@ -442,6 +866,23 @@ main() {
             --init-config)
                 write_default_config
                 exit 0
+                ;;
+            --setup)
+                run_setup
+                exit 0
+                ;;
+            --setup-windows)
+                run_setup_windows
+                exit 0
+                ;;
+            --setup-ssh-key)
+                run_setup_ssh_key
+                exit 0
+                ;;
+            --retries)
+                [[ $# -ge 2 ]] || die "--retries requires a value"
+                RETRY_COUNT="$2"
+                shift 2
                 ;;
             --yes)
                 ASSUME_YES=true
