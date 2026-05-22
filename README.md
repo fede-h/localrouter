@@ -1,170 +1,300 @@
 # localrouter
 
-`localrouter` opens a local SSH tunnel from `localhost:11434` to a remote Ollama server, and can optionally ask the remote host to pull an Ollama model and copy it to a stable target tag before the tunnel opens.
+`localrouter` is a small Go reverse proxy that sits between local AI tools
+and a remote [Ollama](https://ollama.com) instance.
 
-The original workflow is meant for a Linux client using a Windows machine as the GPU host, but the command only assumes that the remote machine is reachable over SSH and has `ollama` on its remote shell `PATH`.
+Clients keep talking to `http://localhost:11434` as if Ollama were running
+on the local machine. `localrouter` forwards the traffic to the upstream
+host, and — if the client requests a model the remote does not yet have —
+it pulls the model on the remote first and then resumes streaming.
 
-## Why this exists
+```
+  ┌─────────────┐    http://localhost:11434     ┌────────────────┐
+  │ editor /    │ ─────────────────────────────►│  localrouter   │
+  │ chat client │ ◄──── streamed chunks ────────│  (this tool)   │
+  └─────────────┘                               └───────┬────────┘
+                                                        │
+                              http://gpu-host:11434     │
+                                                        ▼
+                                              ┌────────────────┐
+                                              │  Ollama (any   │
+                                              │  OS, any GPU)  │
+                                              └────────────────┘
+```
 
-Some local AI tools assume Ollama is available at `http://localhost:11434`. When Ollama is actually running on another machine, `localrouter` lets those tools keep using the local endpoint while SSH forwards traffic to the remote host.
+It is a single, statically linked Go binary (stdlib only) and runs the
+same way on Linux, macOS, and Windows.
+
+> **Heads up.** This is a from-scratch rewrite of the original
+> SSH-tunnel Bash tool. SSH tunneling is no longer part of the picture
+> — `localrouter` speaks HTTP directly to the remote Ollama. If you
+> still need the encrypted hop, terminate TLS in front of Ollama or
+> open your own SSH tunnel and point `--remote` at the local end of
+> it.
+
+## Features
+
+- Transparent reverse proxy with proper chunked / streaming response
+  forwarding (Ollama's `/api/chat` and `/api/generate` work as
+  expected, including token-by-token streams).
+- Intercepts `/api/chat` and `/api/generate`, peeks at the `model`
+  field, and queries the remote's `/api/tags` to confirm the model is
+  installed before forwarding.
+- Optional auto-pull: missing models are downloaded on the remote via
+  `/api/pull` (non-streaming) and the original request is resumed
+  automatically once the pull completes.
+- Concurrent requests for the same missing model share a single pull
+  (no thundering-herd of `/api/pull` calls).
+- Cross-platform process lifecycle: `start` / `stop` / `status` /
+  `restart`, with PID file + HTTP health probe.
+- OS-agnostic config: `os.UserConfigDir` for settings, `os.UserCacheDir`
+  for runtime state. No SSH, systemd, or PowerShell dependencies.
+- 502 when the remote is unreachable, 500 when an auto-pull fails,
+  404 when a model is missing and auto-pull is off — never crashes the
+  proxy.
 
 ## Install
 
-Clone the repo and run:
+### Build from source
+
+Requires Go 1.22 or newer.
 
 ```bash
-sudo ./install.sh
+git clone https://github.com/fede-h/localrouter
+cd localrouter
+go build -o localrouter ./cmd/localrouter
+sudo install -m 0755 localrouter /usr/local/bin/localrouter
 ```
 
-This installs:
-
-- `/usr/local/bin/localrouter`
-- `/usr/local/bin/win-ai` as a compatibility symlink
-
-To install somewhere else:
+Or use the bundled `install.sh` (Linux/macOS):
 
 ```bash
-PREFIX="$HOME/.local" ./install.sh
+git clone https://github.com/fede-h/localrouter
+cd localrouter
+./install.sh                       # installs to /usr/local/bin (sudo)
+PREFIX="$HOME/.local" ./install.sh # or to a user prefix, no sudo
 ```
 
-## Configure
-
-The recommended path is the interactive wizard:
+### Cross-compile
 
 ```bash
-localrouter --setup
+# Linux x86_64
+GOOS=linux   GOARCH=amd64 go build -o dist/localrouter-linux-amd64 ./cmd/localrouter
+
+# Linux arm64
+GOOS=linux   GOARCH=arm64 go build -o dist/localrouter-linux-arm64 ./cmd/localrouter
+
+# macOS Apple Silicon
+GOOS=darwin  GOARCH=arm64 go build -o dist/localrouter-darwin-arm64 ./cmd/localrouter
+
+# macOS Intel
+GOOS=darwin  GOARCH=amd64 go build -o dist/localrouter-darwin-amd64 ./cmd/localrouter
+
+# Windows x86_64
+GOOS=windows GOARCH=amd64 go build -o dist/localrouter-windows-amd64.exe ./cmd/localrouter
 ```
 
-It prompts for `WINDOWS_USER`, `WINDOWS_HOST`, SSH/local/remote ports, target tag, retry behaviour, and writes `~/.config/localrouter/config` atomically (0600). Each value is validated before being saved.
-
-For a non-interactive scaffold, use:
+### Verify
 
 ```bash
-localrouter --init-config        # writes a commented config template
+localrouter version
 ```
 
-Either way you can edit `~/.config/localrouter/config` directly:
+## Quickstart
+
+On the remote machine (the host with the GPU), you need to make Ollama's API reachable from your local network.
+
+**Linux Host:**
+By default Ollama binds to `127.0.0.1:11434`. You must set `OLLAMA_HOST=0.0.0.0:11434` (e.g., via `systemctl edit ollama`) and open port 11434 in your firewall.
+
+**Windows Host:**
+1. Open an elevated PowerShell as Administrator.
+2. Allow incoming traffic through the Windows Defender Firewall:
+   ```powershell
+   New-NetFirewallRule -DisplayName "Ollama API Inbound" -Direction Inbound -Action Allow -Protocol TCP -LocalPort 11434 -Profile Any -Enabled True
+   ```
+3. Set the environment variable so Ollama binds to all network interfaces globally:
+   ```powershell
+   [System.Environment]::SetEnvironmentVariable("OLLAMA_HOST", "0.0.0.0", "Machine")
+   ```
+4. Restart the Ollama app (exit it from the system tray and launch it again).
+
+On the local machine:
 
 ```bash
-WINDOWS_USER="your-windows-user"
-WINDOWS_HOST="192.168.1.50"
+# 1. Write a config file (interactive prompts for remote URL, default model, etc.)
+localrouter init-config
 
-# Optional defaults:
-SSH_PORT="22"
-LOCAL_PORT="11434"
-REMOTE_HOST="localhost"
-REMOTE_PORT="11434"
-TARGET_TAG="qwen2.5-coder:7b"
-STOP_LOCAL_OLLAMA="ask"
-SSH_OPTS="-o ServerAliveInterval=30 -o ExitOnForwardFailure=yes"
-RETRY_COUNT="3"
-RETRY_BACKOFF="2"
-PULL_TIMEOUT="1800"
-CACHE_TTL="60"
-WATCH_BACKOFF_MAX="30"
+# 2. Run the proxy in the foreground; Ctrl+C to stop.
+localrouter serve
+
+# Or run it in the background:
+localrouter start
+localrouter status
+localrouter stop
 ```
 
-Environment-variable overrides for any of these: prefix with `LOCALROUTER_` (e.g. `LOCALROUTER_PULL_TIMEOUT=3600 localrouter use big-model`).
+Point your AI tool at `http://localhost:11434` exactly like a local
+Ollama. The first time you call `/api/chat` or `/api/generate` with a
+model the remote does not have, `localrouter` will pull it for you (this
+can take a while for large models — increase `pull_timeout_secs` if
+needed).
 
-Edit model choices in `~/.config/localrouter/models.list`, or use:
+## Subcommands
+
+| Command                                  | What it does                                              |
+| ---------------------------------------- | ---------------------------------------------------------- |
+| `localrouter`                            | Interactive: pick a model, set as default, start daemon.   |
+| `localrouter serve` (alias `watch`)      | Run the proxy in the foreground.                           |
+| `localrouter start`                      | Spawn the proxy in the background; write PID file.         |
+| `localrouter stop` (alias `kill`)        | Stop the running daemon.                                   |
+| `localrouter restart`                    | `stop` + `start`.                                          |
+| `localrouter status`                     | Daemon state + remote reachability + recent timestamps.    |
+| `localrouter list [--installed]`         | Configured + installed model list with sizes.              |
+| `localrouter info <model>`               | `/api/show` for a model.                                   |
+| `localrouter pull <model>`               | Synchronous pull on the remote (mirrors the auto-pull).    |
+| `localrouter use <model> [--start]`      | Set the default model; optionally start the proxy.         |
+| `localrouter config`                     | Print resolved paths + current config.                     |
+| `localrouter init-config`                | Write a starter `config.json` + `models.list`.             |
+| `localrouter version`                    | Print version.                                             |
+
+Every subcommand accepts `--help` to list its flags.
+
+### Foreground vs background
+
+For unattended use under `systemd`, `launchd`, Windows Service Manager, or
+`tmux`/`nohup`, run `localrouter serve` (or `watch`) — it stays in the
+foreground, logs to stdout/stderr, and shuts down on SIGINT/SIGTERM.
+
+`localrouter start` is a convenience for "just background it on this
+shell". On Linux/macOS the child gets its own session
+(`setsid`-equivalent) so it survives the launching terminal closing. On
+Windows the child runs in a new process group with no console.
+
+## Configuration
+
+Config lives at the user-config dir for the platform:
+
+| Platform | Config file                                                    | State / cache                                    |
+| -------- | -------------------------------------------------------------- | ------------------------------------------------ |
+| Linux    | `$XDG_CONFIG_HOME/localrouter/config.json` (`~/.config/...`)   | `$XDG_CACHE_HOME/localrouter/` (`~/.cache/...`) |
+| macOS    | `~/Library/Application Support/localrouter/config.json`        | `~/Library/Caches/localrouter/`                  |
+| Windows  | `%AppData%\localrouter\config.json`                            | `%LocalAppData%\localrouter\`                    |
+
+`localrouter config` prints the resolved paths and current values.
+
+### `config.json`
+
+```json
+{
+  "listen_addr":        "localhost:11434",
+  "remote_url":         "http://192.168.1.50:11434",
+  "auto_pull":          true,
+  "pull_timeout_secs":  1800,
+  "reach_timeout_ms":   1500,
+  "default_model":      "qwen2.5-coder:7b"
+}
+```
+
+| Field               | What it controls                                                                |
+| ------------------- | ------------------------------------------------------------------------------- |
+| `listen_addr`       | Local bind address. Use `0.0.0.0:11434` to expose on the LAN (consider auth).   |
+| `remote_url`        | Upstream Ollama base URL. Scheme + host + port.                                 |
+| `auto_pull`         | When `true`, missing models are pulled on demand. When `false`, return 404.     |
+| `pull_timeout_secs` | Per-pull timeout. Increase for huge models on slow links.                       |
+| `reach_timeout_ms`  | TCP probe deadline used by `status` and pre-flight checks.                      |
+| `default_model`     | Used by the interactive picker; persisted across runs.                          |
+
+### `models.list`
+
+A plain text file in the same config dir, one Ollama tag per line. Used
+by the interactive picker and `localrouter list`. Lines beginning with
+`#` are comments.
+
+```
+qwen2.5-coder:7b
+llama3.1:8b
+mistral:7b
+```
+
+### Environment overrides (transient — never persisted)
+
+Useful for one-off invocations under wrappers and editors:
+
+| Variable                       | Effect                                                  |
+| ------------------------------ | ------------------------------------------------------- |
+| `LOCALROUTER_LISTEN`           | Override `listen_addr`.                                 |
+| `LOCALROUTER_REMOTE`           | Override `remote_url`.                                  |
+| `LOCALROUTER_AUTO_PULL`        | `true`/`false`.                                         |
+| `LOCALROUTER_DEFAULT_MODEL`    | Override `default_model`.                               |
+| `LOCALROUTER_PULL_TIMEOUT`     | Pull timeout in seconds.                                |
+| `LOCALROUTER_REACH_TIMEOUT_MS` | TCP probe timeout in milliseconds.                      |
+
+`localrouter use <model>` and `init-config` deliberately write **only**
+fields you set explicitly — env-var overrides do not leak into
+`config.json`.
+
+## Behavior contract (per request)
+
+For every `POST /api/chat` and `POST /api/generate`:
+
+1. Read the body into memory (capped at 8 MB) and restore it with
+   `io.NopCloser(bytes.NewReader(body))` so the reverse proxy sees an
+   identical request.
+2. Extract the `model` field. Missing field → forward as-is and let
+   Ollama answer.
+3. Call `GET /api/tags` on the remote. Match the requested model
+   against `name` (and `name:latest` if the requester omitted the tag).
+4. If installed → forward.
+5. If not installed and `auto_pull=false` → return `404` with a JSON
+   error.
+6. If not installed and `auto_pull=true` → call `POST /api/pull` with
+   `stream:false`, wait for completion (subject to `pull_timeout_secs`),
+   then forward. Concurrent requests for the same model share one pull.
+7. If the remote is unreachable at any point → `502 Bad Gateway`.
+8. If the pull itself fails → `500 Internal Server Error` with the
+   remote's error message.
+
+All other paths (`/api/tags`, `/api/show`, `/api/embed`, ...) are
+forwarded untouched. The proxy also exposes
+`GET /__localrouter/healthz` for `status` to verify it's the right
+process on the listen port.
+
+## Health endpoint
 
 ```bash
-localrouter --edit-models
+$ curl http://localhost:11434/__localrouter/healthz
+{"ok":true,"service":"localrouter","remote":"http://192.168.1.50:11434","auto_pull":true}
 ```
 
-### Passwordless SSH
+## Repository layout
 
-```bash
-localrouter --setup-ssh-key
+```
+cmd/localrouter/      Main entrypoint, CLI subcommands, flag parsing.
+internal/proxy/       httputil.ReverseProxy + interception + pull coalescing.
+internal/ollama/      Stdlib HTTP client for /api/tags, /api/show, /api/pull.
+internal/config/      OS-agnostic config + models.list + state.json.
+internal/daemon/      PID file, liveness probe, cross-platform Spawn/Stop.
 ```
 
-Generates `~/.ssh/localrouter_<host>` (ed25519, no passphrase), installs the public key on the Windows host (auto-detects whether the SSH user is an admin and writes to `%USERPROFILE%\.ssh\authorized_keys` or `C:\ProgramData\ssh\administrators_authorized_keys` accordingly), tightens ACLs with `icacls`, and merges `-i <key>` into `SSH_OPTS` so future commands skip the password prompt.
+All packages use only the Go standard library.
 
-### Bootstrap the Windows host
+## Security notes
 
-```bash
-localrouter --setup-windows
-```
+- The proxy binds to `localhost:11434` by default. If you switch
+  `listen_addr` to a non-loopback address, anything on that network can
+  reach the upstream Ollama through you (including auto-pulling models
+  you don't want pulled). See `FUTURES.md` for the planned auth /
+  TLS work.
+- The upstream call uses plain HTTP. If the remote is across an
+  untrusted network, terminate TLS in front of it or open your own
+  SSH/WireGuard tunnel and point `--remote` at the tunnel endpoint.
+- `pull_timeout_secs` is the only governor on auto-pull duration. On
+  a shared machine, treat each `/api/chat` for an unknown tag as
+  "this client can make the remote spend disk space and bandwidth."
 
-Pipes a vetted, idempotent PowerShell script through your SSH session that:
+## Roadmap
 
-- ensures the `sshd` service is set to **Automatic** startup and is **Running**
-- sets any non-`Private` network connection profiles to `Private` (so the firewall rule applies on this network)
-- adds a firewall rule named `localrouter SSH inbound` allowing TCP `SSH_PORT` inbound on all profiles (only if a rule with that name does not already exist)
-- reports whether `ollama` is on the SSH user's `PATH`
-- reports whether `sshd` is listening on `SSH_PORT`
-
-It will **not** install OpenSSH Server itself — that needs to happen once on the Windows host with `Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0` (requires admin). Without it there is no SSH session to pipe through.
-
-All remote operations (`--setup-windows`, `--setup-ssh-key`, `--model …`) are wrapped in a retry loop. Override with `--retries N`, `LOCALROUTER_RETRIES`, or `LOCALROUTER_RETRY_BACKOFF` (seconds, linear). Default: 3 retries, 2s backoff.
-
-## Use
-
-`localrouter` uses a `<verb> [args]` shape. Run with no arguments for the interactive selector.
-
-```bash
-localrouter                              # interactive: pick a model + open tunnel
-localrouter use qwen2.5-coder:7b         # pull/cp + open tunnel for this model
-localrouter use qwen2.5-coder:7b --force # re-pull even if installed
-localrouter use --keep                   # open/reuse tunnel, no model swap
-localrouter list                         # configured models + installed status + size
-localrouter list --refresh               # bypass the cache
-localrouter status                       # remote, tunnel, last-tunnel/pull/use times
-localrouter kill                         # close any running localrouter tunnel
-localrouter restart                      # kill + reopen with the tracked model
-localrouter info qwen2.5-coder:7b        # ollama metadata for the model
-localrouter watch                        # foreground supervisor: auto-reconnect on drop
-```
-
-Pre-checks and timeouts: before any pull, `localrouter` runs `ollama list` over SSH as a fast preflight (skip with `--no-preflight`). If the model is already installed it skips the pull (override with `--force`). The pull itself is wrapped in `timeout` (default 30 min; `--pull-timeout SECS` or `LOCALROUTER_PULL_TIMEOUT`).
-
-Installed-model state is cached at `~/.local/state/localrouter/installed.cache` (60 s TTL by default; `LOCALROUTER_CACHE_TTL`). `--refresh` invalidates it.
-
-Auto-reconnect: `localrouter watch` blocks the terminal, opens the tunnel, restarts it on drop with exponential backoff capped at `LOCALROUTER_WATCH_BACKOFF_MAX` (default 30 s). Ctrl+C exits cleanly. Run under `tmux`/`nohup` if you want it detached.
-
-### Legacy flag aliases
-
-For backwards compatibility:
-
-| Legacy flag             | New verb                |
-|------------------------ |------------------------ |
-| `--model MODEL`         | `use MODEL`             |
-| `--status`              | `status`                |
-| `--setup`               | `setup`                 |
-| `--setup-windows`       | `setup windows`         |
-| `--setup-ssh-key`       | `setup ssh-key`         |
-| `--edit-models`         | `edit-models`           |
-| `--init-config`         | `init-config`           |
-| `--keep` (positional)   | `use --keep`            |
-
-## Remote Requirements
-
-On the remote host:
-
-- SSH server is enabled and reachable from the local machine.
-- The configured user can run `ollama pull` and `ollama cp`.
-- Ollama listens on the remote host/port configured by `REMOTE_HOST` and `REMOTE_PORT`.
-
-For Windows hosts, OpenSSH Server must be installed and running. Ollama must be available to the SSH session, which may require adding Ollama to the system `PATH` or using the shell profile for the SSH user.
-
-## Security Model
-
-This tool can touch privileged surfaces:
-
-- It may run `sudo systemctl stop ollama` locally if local Ollama owns the forwarded port.
-- It connects to a remote host over SSH.
-- It asks the remote host to run `ollama pull` and `ollama cp`.
-- `--setup-windows` asks the remote host to: change the `sshd` service start type, start `sshd`, set network connection profiles to `Private`, and create a Windows Firewall rule for `SSH_PORT`. Each of those steps is idempotent (checks current state before changing it) and the script is printed in `bin/localrouter` for inspection.
-- `--setup-ssh-key` writes to the remote `authorized_keys` (or `administrators_authorized_keys`) file and runs `icacls` to tighten its ACL.
-
-`localrouter` does not store passwords. Prefer SSH keys with passphrases and host-key verification. Do not disable SSH host-key checking in shared scripts or docs. `--setup-ssh-key` generates a key with no passphrase by design (passwordless automation); only run it on hosts where that trade-off is acceptable.
-
-`WINDOWS_USER`, `WINDOWS_HOST`, ports, model names, and target tags are validated before being passed to `ssh` or PowerShell. Keep that validation strict if you add more remote operations.
-
-## Current Limitations
-
-- Installing the OpenSSH Server capability itself on Windows is still manual (chicken-and-egg with SSH connectivity).
-- The local port conflict handler only knows how to stop a systemd `ollama` service.
-- This is a Bash CLI for Linux/macOS clients. Native PowerShell client support is out of scope for now.
-- `--setup-ssh-key` generates a passphrase-less key; if you want a passphrase, generate the key manually and add `-i <path>` to `SSH_OPTS` yourself.
-- IPv6 literals in `WINDOWS_HOST` are not yet supported.
+See [`FUTURES.md`](./FUTURES.md) for the list of planned features and
+deliberate non-features (things the original Bash tool did that the new
+tool no longer does).

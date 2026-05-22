@@ -6,3 +6,10 @@
 # Local runtime state. User config lives in ~/.config/localrouter.
 .env
 .env.*
+
+# Build artifacts
+/dist/
+
+# Go workspace files (not committed; user-local)
+go.work
+go.work.sum
