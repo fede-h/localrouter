@@ -13,7 +13,7 @@
 //	pull <model>          ask the remote to pull a model
 //	use <model>           set the default model (and optionally start)
 //	config                print resolved config paths and values
-//	init-config           write a starter config.json + models.list
+//	init-config           write or update config.json + models.list
 //	version               print the version and exit
 //
 // Top-level flags on `serve` mirror the comeback_prompt.md contract:
@@ -82,7 +82,7 @@ func run(args []string) error {
 	case "config":
 		return cmdConfig()
 	case "init-config":
-		return cmdInitConfig()
+		return cmdInitConfig(args[1:])
 	case "version", "--version", "-v":
 		fmt.Println(version)
 		return nil
@@ -112,7 +112,7 @@ Commands:
   pull <model>              ask the remote to pull a model
   use <model> [--start]     set default model (optionally start the proxy)
   config                    show paths and resolved config
-  init-config               write a starter config + models.list
+  init-config               write or update config + models.list
   version                   print version
 
 Run "localrouter <command> --help" for command-specific flags.
@@ -665,7 +665,21 @@ func cmdConfig() error {
 // init-config
 // ---------------------------------------------------------------------------
 
-func cmdInitConfig() error {
+func cmdInitConfig(args []string) error {
+	fs := flag.NewFlagSet("init-config", flag.ContinueOnError)
+	remote := fs.String("remote", "", "remote Ollama URL to persist")
+	listen := fs.String("listen", "", "local listen address to persist")
+	defaultModel := fs.String("default-model", "", "default model to persist")
+	var autoPull tristateFlag
+	fs.Var(&autoPull, "auto-pull", "persist auto-pull setting (true|false)")
+	force := fs.Bool("force", false, "update an existing config file instead of erroring")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if len(fs.Args()) != 0 {
+		return errors.New("usage: localrouter init-config [--remote URL] [--listen ADDR] [--default-model TAG] [--auto-pull=true|false] [--force]")
+	}
+
 	paths, err := config.ResolvePaths()
 	if err != nil {
 		return err
@@ -674,23 +688,47 @@ func cmdInitConfig() error {
 		return err
 	}
 
+	cfg := config.Defaults()
+	existed := false
 	if _, err := os.Stat(paths.ConfigFile); err == nil {
-		return fmt.Errorf("config already exists at %s — edit it directly, or remove it first", paths.ConfigFile)
+		existed = true
+		if !*force {
+			return fmt.Errorf("config already exists at %s — edit it directly, or rerun `localrouter init-config --force`", paths.ConfigFile)
+		}
+		cfg, err = config.LoadFile(paths)
+		if err != nil {
+			return err
+		}
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("stat config: %w", err)
 	}
 
-	cfg := config.Defaults()
-	cfg.RemoteURL = promptString(
-		"Remote Ollama URL (e.g. http://192.168.1.50:11434)",
-		"",
-	)
+	if *remote != "" {
+		cfg.RemoteURL = *remote
+	} else {
+		cfg.RemoteURL = promptString(
+			"Remote Ollama URL (e.g. http://192.168.1.50:11434)",
+			cfg.RemoteURL,
+		)
+	}
 	if cfg.RemoteURL == "" {
 		fmt.Fprintln(os.Stderr, "no remote URL provided — you can edit "+paths.ConfigFile+" later.")
 	}
-	cfg.ListenAddr = promptString("Local listen address", cfg.ListenAddr)
-	cfg.DefaultModel = promptString("Default model (optional)", "")
-	cfg.AutoPull = promptBool("Auto-pull missing models on demand?", true)
+	if *listen != "" {
+		cfg.ListenAddr = *listen
+	} else {
+		cfg.ListenAddr = promptString("Local listen address", cfg.ListenAddr)
+	}
+	if *defaultModel != "" {
+		cfg.DefaultModel = *defaultModel
+	} else {
+		cfg.DefaultModel = promptString("Default model (optional)", cfg.DefaultModel)
+	}
+	if autoPull.set {
+		cfg.AutoPull = autoPull.value
+	} else {
+		cfg.AutoPull = promptBool("Auto-pull missing models on demand?", cfg.AutoPull)
+	}
 
 	if err := config.Save(paths, cfg); err != nil {
 		return err
@@ -699,7 +737,11 @@ func cmdInitConfig() error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("wrote %s\n", paths.ConfigFile)
+	if existed {
+		fmt.Printf("updated %s\n", paths.ConfigFile)
+	} else {
+		fmt.Printf("wrote %s\n", paths.ConfigFile)
+	}
 	if wrote {
 		fmt.Printf("wrote starter %s (edit to taste)\n", paths.ModelsFile)
 	}
@@ -717,7 +759,7 @@ func cmdInteractive() error {
 	}
 	if cfg.RemoteURL == "" {
 		fmt.Println("No remote configured. Running `localrouter init-config` first.")
-		return cmdInitConfig()
+		return cmdInitConfig(nil)
 	}
 
 	pid, _ := daemon.ReadPID(paths.PIDFile)

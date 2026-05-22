@@ -4,12 +4,13 @@ set -Eeuo pipefail
 # install.sh — build localrouter from source and install the binary.
 #
 #   PREFIX="$HOME/.local" ./install.sh   # user-local, no sudo
+#   BINDIR="$HOME/bin" ./install.sh      # custom bin dir
 #   sudo ./install.sh                    # system-wide (defaults to /usr/local)
 #
 # Requires Go 1.22+. Works on Linux and macOS.
 
 PREFIX="${PREFIX:-/usr/local}"
-BINDIR="$PREFIX/bin"
+BINDIR="${BINDIR:-$PREFIX/bin}"
 SOURCE_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 if ! command -v go >/dev/null 2>&1; then
@@ -29,4 +30,14 @@ install -d "$BINDIR"
 install -m 0755 "$BUILD_DIR/localrouter" "$BINDIR/localrouter"
 
 printf 'Installed localrouter to %s/localrouter\n' "$BINDIR"
-printf 'Run: localrouter init-config\n'
+case ":${PATH:-}:" in
+    *":$BINDIR:"*) ;;
+    *)
+        printf 'warning: %s is not on PATH\n' "$BINDIR"
+        printf 'Add it in your shell profile if needed:\n'
+        printf '  export PATH="%s:$PATH"\n' "$BINDIR"
+        ;;
+esac
+printf 'Next:\n'
+printf '  localrouter init-config --remote http://HOST:11434\n'
+printf '  localrouter serve\n'
